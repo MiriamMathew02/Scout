@@ -15,6 +15,7 @@ from agent.execution.execute import run_plan_step
 from agent.planning.plan import create_plan
 from agent.state import AgentState, Phase
 from agent.summary.summarize import build_summary
+from agent.verification.consistency import check_consistency
 from agent.verification.verify import verify_changes
 
 
@@ -40,6 +41,7 @@ def run_agent(state: AgentState, *, client: Any = None) -> AgentState:
         Phase.PLAN: lambda s: handle_plan(s, client=client),
         Phase.EXECUTE: lambda s: handle_execute(s, client=client),
         Phase.VERIFY: lambda s: handle_verify(s),
+        Phase.CONSISTENCY: lambda s: handle_consistency(s, client=client),
         Phase.SUMMARIZE: lambda s: handle_summarize(s),
     }
 
@@ -218,7 +220,8 @@ def handle_verify(state: AgentState) -> None:
     state.note(state.verify_result.splitlines()[0] if state.verify_result else "verify done")
 
     if result.ok:
-        state.phase = Phase.SUMMARIZE
+        # Syntax OK → cross-file consistency over changed files + neighbors
+        state.phase = Phase.CONSISTENCY
         return
 
     state.last_error = state.verify_result
@@ -236,6 +239,86 @@ def handle_verify(state: AgentState) -> None:
         state.replan_count += 1
         _safe_rollback(state)
         state.note("verify failed; replanning")
+        state.phase = Phase.PLAN
+        return
+
+    state.phase = Phase.FAILED
+
+
+def handle_consistency(state: AgentState, *, client: Any = None) -> None:
+    """
+    After syntax verify: inspect changed files and their graph neighbors
+    for cross-file mistakes (missing exports, wrong handler names, etc.).
+    """
+    state.note("consistency check (changed files + graph neighbors)")
+    touched = list(dict.fromkeys(h.path for h in state.applied_edits))
+
+    # Refresh graph so new requires are visible when possible
+    root = Path(state.repo_path)
+    scope_seeds = list(dict.fromkeys(touched + state.relevant_files))[:250]
+    if scope_seeds:
+        try:
+            from agent.discovery.graph import build_dependency_graph
+
+            # Merge with existing graph rather than drop unrelated edges
+            fresh = build_dependency_graph(
+                root,
+                list(dict.fromkeys(list(state.graph.keys()) + scope_seeds))[:400],
+            )
+            state.graph = fresh
+        except Exception as exc:  # noqa: BLE001
+            state.note(f"graph refresh skipped: {exc}")
+
+    import os
+
+    # Prefer LLM review when a client or API key is available; always run static checks
+    use_llm = client is not None or bool(os.environ.get("GROQ_API_KEY"))
+    result = check_consistency(
+        root,
+        touched,
+        state.graph,
+        hops=1,
+        use_llm=use_llm,
+        model=state.model,
+        task=state.task,
+        client=client,
+    )
+    state.consistency_result = result.as_text()
+    state.note(
+        "consistency PASS"
+        if result.ok
+        else f"consistency FAIL ({len(result.issues)} issue(s))"
+    )
+    for issue in result.issues[:8]:
+        state.note(issue.message)
+
+    if result.ok:
+        state.phase = Phase.SUMMARIZE
+        return
+
+    # Feed precise issues back into execute so the model can fix wiring
+    state.last_error = (
+        "Cross-file consistency check failed. Fix these without breaking other behavior:\n"
+        + result.as_text()
+    )
+
+    if state.retry_count < state.max_execute_retries:
+        state.retry_count += 1
+        # Do NOT full-rollback good work if only wiring is wrong — keep files,
+        # re-run execute with error context so the model can patch names.
+        for step in state.plan:
+            if step.status != "skipped":
+                step.status = "pending"
+        state.note(
+            f"consistency failed; retry execute with fix context "
+            f"({state.retry_count}/{state.max_execute_retries})"
+        )
+        state.phase = Phase.EXECUTE
+        return
+
+    if state.replan_count < state.max_replans:
+        state.replan_count += 1
+        state.note("consistency failed; replanning")
         state.phase = Phase.PLAN
         return
 

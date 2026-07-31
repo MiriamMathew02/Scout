@@ -11,6 +11,7 @@ class Phase(str, Enum):
     PLAN = "plan"
     EXECUTE = "execute"
     VERIFY = "verify"
+    CONSISTENCY = "consistency"  # cross-file check: changed + graph neighbors
     SUMMARIZE = "summarize"
     DONE = "done"
     FAILED = "failed"
@@ -72,6 +73,7 @@ class AgentState:
     replan_count: int = 0
 
     verify_result: str = ""
+    consistency_result: str = ""
     summary: str = ""
     log: list[str] = field(default_factory=list)
 

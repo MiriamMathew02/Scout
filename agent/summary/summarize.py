@@ -55,9 +55,16 @@ def build_summary(state: AgentState) -> str:
         lines.append("")
 
     if state.verify_result:
-        lines.append("## Verification")
+        lines.append("## Verification (syntax)")
         lines.append("```")
         lines.append(state.verify_result.strip())
+        lines.append("```")
+        lines.append("")
+
+    if state.consistency_result:
+        lines.append("## Consistency (changed + neighbors)")
+        lines.append("```")
+        lines.append(state.consistency_result.strip())
         lines.append("```")
         lines.append("")
 

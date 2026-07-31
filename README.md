@@ -12,7 +12,8 @@ A Python CLI agent that explores a codebase, plans changes, applies **atomic lin
 2. **Plan** — short ordered execution plan  
 3. **Execute** — surgical line-range edits with rollback  
 4. **Verify** — soft multi-language syntax checks; optional project tests  
-5. **Summarize** — human-readable report  
+5. **Consistency** — re-check **changed files + graph neighbors** for cross-file mistakes (e.g. route handler name ≠ controller export)  
+6. **Summarize** — human-readable report  
 
 Works across languages and stacks: edits are text-based; dependency edges are best-effort per language.
 
@@ -46,10 +47,15 @@ Exit code `0` = success (`DONE`), `1` = failure (`FAILED`).
 ## Architecture
 
 ```
-DISCOVER → PLAN → EXECUTE → VERIFY → SUMMARIZE → DONE
-                ↑              │
-                └──── retry ◄──┘
+DISCOVER → PLAN → EXECUTE → VERIFY → CONSISTENCY → SUMMARIZE → DONE
+                ↑              │           │
+                └──── retry ◄──┴───────────┘
 ```
+
+`CONSISTENCY` expands the dependency graph around every touched file and runs static
+checks (JS `require` → `exports` wiring, light Python imports) plus a small LLM review.
+Failures return to **EXECUTE** with a concrete error (no silent SUCCESS on name mismatches).
+
 
 Importable building blocks (used by the loop, also callable on their own):
 
