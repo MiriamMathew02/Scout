@@ -47,10 +47,7 @@ Exit code `0` = success (`DONE`), `1` = failure (`FAILED`).
 
 ## Architecture
 
-```
 <img width="560" height="523" alt="Screenshot 2026-08-02 223916" src="https://github.com/user-attachments/assets/4486c570-b54d-4ddf-b0e5-39ad9e48683a" />
-
-```
 
 | Phase | Catches |
 |-------|---------|
