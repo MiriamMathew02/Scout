@@ -51,8 +51,14 @@ Exit code `0` = success (`DONE`), `1` = failure (`FAILED`).
 
 | Phase | Catches |
 |-------|---------|
-| Consistency | Wrong handler names (`notes.search` vs `exports.searchNotes`) |
-| Behavior | Schema field not plumbed through create/update; mixed `/notes` vs `/api/notes` |
+| Discover | Uses heuristics to identify the most important files and build a dependency graph |
+| Plan | Using the context and the input, into a plan for the edits |
+| Execute | Apply the edits line-by-line |
+| Verify | Check that each file (that has been edited) is readable and syntactically correct |
+| Consistency | Check that the neighbour files still call each other by the right name |
+| Behavior | Check that the feature is not half-done |
+| Summarize | Write a short report of what was done |
+
 
 ```powershell
 python -m agent --repo PATH --task "..." --fast          # fewer LLM calls
