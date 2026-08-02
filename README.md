@@ -48,9 +48,8 @@ Exit code `0` = success (`DONE`), `1` = failure (`FAILED`).
 ## Architecture
 
 ```
-DISCOVER → PLAN → EXECUTE → VERIFY → CONSISTENCY → BEHAVIOR → SUMMARIZE → DONE
-                              │            │            │
-                              └──── retry execute / replan ◄─┘
+<img width="560" height="523" alt="image" src="https://github.com/user-attachments/assets/b6f40faa-23c5-48b8-931e-77142a3dc448" />
+
 ```
 
 | Phase | Catches |
@@ -82,19 +81,3 @@ Importable building blocks (used by the loop, also callable on their own):
 | `verify_changes` | `agent.verification.verify` |
 | `build_summary` | `agent.summary.summarize` |
 | `run_agent` | `agent.loop` |
-
-## Tests
-
-```powershell
-pytest -q
-```
-
-Fixtures live under `fixtures/mini_py` and `fixtures/mini_js`.
-
-## Environment
-
-| Variable | Description |
-|----------|-------------|
-| `GROQ_API_KEY` | API key from [console.groq.com](https://console.groq.com) |
-
-Default model: `llama-3.3-70b-versatile` (OpenAI-compatible endpoint `https://api.groq.com/openai/v1`).
