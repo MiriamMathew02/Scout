@@ -10,6 +10,11 @@ from agent.discovery.graph import (
 )
 from agent.discovery.snippets import read_line_numbered, excerpt_for_prompt
 from agent.discovery.explore import explore_with_llm
+from agent.discovery.symbols import (
+    build_symbol_graph,
+    check_schema_field_plumbing,
+    detect_added_schema_fields,
+)
 
 __all__ = [
     "scan_file_tree",
@@ -22,4 +27,7 @@ __all__ = [
     "read_line_numbered",
     "excerpt_for_prompt",
     "explore_with_llm",
+    "build_symbol_graph",
+    "check_schema_field_plumbing",
+    "detect_added_schema_fields",
 ]

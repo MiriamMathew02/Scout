@@ -68,6 +68,13 @@ def build_summary(state: AgentState) -> str:
         lines.append("```")
         lines.append("")
 
+    if state.behavior_result:
+        lines.append("## Behavior (field plumbing / acceptance)")
+        lines.append("```")
+        lines.append(state.behavior_result.strip())
+        lines.append("```")
+        lines.append("")
+
     if state.last_error and state.phase == Phase.FAILED:
         lines.append("## Error")
         lines.append(state.last_error)

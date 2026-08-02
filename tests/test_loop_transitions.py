@@ -33,7 +33,7 @@ def test_verify_pass_goes_to_consistency(tmp_path):
     assert "PASS" in state.verify_result
 
 
-def test_consistency_pass_goes_to_summarize(tmp_path, monkeypatch):
+def test_consistency_pass_goes_to_behavior(tmp_path, monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     f = tmp_path / "ok.py"
     f.write_text("x = 1\n", encoding="utf-8")
@@ -44,7 +44,7 @@ def test_consistency_pass_goes_to_summarize(tmp_path, monkeypatch):
     ]
     state.graph = {"ok.py": []}
     handle_consistency(state, client=None)
-    assert state.phase == Phase.SUMMARIZE
+    assert state.phase == Phase.BEHAVIOR
     assert "PASS" in state.consistency_result
 
 

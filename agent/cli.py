@@ -47,6 +47,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Max phase-loop iterations (default: 20)",
     )
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help="Faster run: skip explore LLM and deep LLM reviews (static checks only)",
+    )
+    p.add_argument(
+        "--deep-review",
+        action="store_true",
+        help="Enable extra LLM reviews (consistency + behavior acceptance)",
+    )
     return p
 
 
@@ -64,12 +74,18 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         run_tests=args.run_tests,
         max_iterations=args.max_iterations,
+        fast=args.fast,
+        deep_review=args.deep_review,
     )
 
     print(f"Starting agent on {repo}")
     print(f"Task: {args.task}")
     if args.dry_run:
         print("Dry-run mode: no files will be written")
+    if args.fast:
+        print("Fast mode: fewer LLM calls")
+    if args.deep_review:
+        print("Deep review: extra LLM acceptance checks")
     print("---")
 
     try:

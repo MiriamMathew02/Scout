@@ -10,11 +10,13 @@ from agent.discovery.graph import build_dependency_graph, neighbors
 from agent.discovery.heuristics import filter_candidates, rank_by_task_signals
 from agent.discovery.scan import scan_file_tree
 from agent.discovery.stack import detect_stack
+from agent.discovery.symbols import build_symbol_graph
 from agent.execution.atomic_edit import EditError, rollback_edits
 from agent.execution.execute import run_plan_step
 from agent.planning.plan import create_plan
 from agent.state import AgentState, Phase
 from agent.summary.summarize import build_summary
+from agent.verification.behavior import check_behavior
 from agent.verification.consistency import check_consistency
 from agent.verification.verify import verify_changes
 
@@ -35,13 +37,14 @@ def _safe_rollback(state: AgentState) -> None:
 
 
 def run_agent(state: AgentState, *, client: Any = None) -> AgentState:
-    """Run the discover → plan → execute → verify → summarize loop."""
+    """Run discover → plan → execute → verify → consistency → behavior → summarize."""
     handlers: dict[Phase, Handler] = {
         Phase.DISCOVER: lambda s: handle_discover(s, client=client),
         Phase.PLAN: lambda s: handle_plan(s, client=client),
         Phase.EXECUTE: lambda s: handle_execute(s, client=client),
         Phase.VERIFY: lambda s: handle_verify(s),
         Phase.CONSISTENCY: lambda s: handle_consistency(s, client=client),
+        Phase.BEHAVIOR: lambda s: handle_behavior(s, client=client),
         Phase.SUMMARIZE: lambda s: handle_summarize(s),
     }
 
@@ -112,15 +115,28 @@ def handle_discover(state: AgentState, *, client: Any = None) -> None:
         f"candidates={len(state.candidates)} languages={state.stack_hints.languages}"
     )
 
-    # Graph on a capped set for speed
     graph_files = state.candidates[:250]
     state.graph = build_dependency_graph(root, graph_files)
-    state.note(f"graph nodes={len(state.graph)}")
+    state.note(f"file graph nodes={len(state.graph)}")
 
-    ranked, summary = explore_with_llm(state, tree, client=client)
+    state.symbol_graph = build_symbol_graph(root, graph_files)
+    n_sym = len(getattr(state.symbol_graph, "symbols", {}))
+    state.note(f"symbol graph nodes={n_sym}")
+
+    if state.fast:
+        # Skip explore LLM — use heuristic shortlist only
+        ranked = state.candidates[:15]
+        state.repo_summary = (
+            f"Fast mode (no explore LLM). Languages: "
+            f"{', '.join(state.stack_hints.languages)}. "
+            f"Top candidates: {', '.join(ranked[:8])}"
+        )
+        state.note("explore skipped (--fast)")
+    else:
+        ranked, summary = explore_with_llm(state, tree, client=client)
+        state.repo_summary = summary
+
     state.relevant_files = neighbors(state.graph, ranked, hops=1)
-    # Prefer candidates order stability for unknowns
-    state.repo_summary = summary
     state.note(f"relevant_files={len(state.relevant_files)}")
     state.phase = Phase.PLAN
 
@@ -138,11 +154,18 @@ def handle_execute(state: AgentState, *, client: Any = None) -> None:
     state.note("executing plan")
     pending = [s for s in state.plan if s.status == "pending"]
     if not pending:
-        # re-run all if retry after verify
-        for s in state.plan:
-            if s.status in {"failed", "done"}:
-                s.status = "pending"
-        pending = [s for s in state.plan if s.status == "pending"]
+        # Prefer re-running only previously failed step when set
+        if state.failed_step_id:
+            for s in state.plan:
+                if s.id == state.failed_step_id:
+                    s.status = "pending"
+                    pending = [s]
+                    break
+        if not pending:
+            for s in state.plan:
+                if s.status in {"failed", "done"}:
+                    s.status = "pending"
+            pending = [s for s in state.plan if s.status == "pending"]
 
     edits_before = len(state.applied_edits)
     try:
@@ -150,41 +173,59 @@ def handle_execute(state: AgentState, *, client: Any = None) -> None:
             if step.status == "skipped":
                 continue
             state.note(f"step {step.id}: {step.description}")
-            summaries = run_plan_step(state, step, client=client)
+            try:
+                summaries = run_plan_step(state, step, client=client)
+            except EditError:
+                state.failed_step_id = step.id
+                raise
             for line in summaries:
                 state.note(line)
             if step.status != "skipped":
                 step.status = "done"
-        # Must actually change code for a successful implement run
+        state.failed_step_id = None
         if len(state.applied_edits) == edits_before and not any(
             s.status == "done" and s.action == "delete" for s in state.plan
         ):
-            # All steps skipped or empty — treat as failure to replan
-            raise EditError(
-                "No code edits were applied for the task. "
-                "Plan steps produced no file changes."
-            )
+            # Allow zero new edits on repair rounds if files already changed earlier
+            if not state.applied_edits and not state.backups:
+                raise EditError(
+                    "No code edits were applied for the task. "
+                    "Plan steps produced no file changes."
+                )
         state.last_error = None
         state.phase = Phase.VERIFY
     except EditError as exc:
         state.last_error = str(exc)
         state.note(f"edit error: {exc}")
-        # mark current pending as failed
         for step in state.plan:
             if step.status == "pending":
                 step.status = "failed"
+                state.failed_step_id = step.id
                 break
         if state.retry_count < state.max_execute_retries:
             state.retry_count += 1
+            # Step-local retry: rollback only if we have no successful prior edits
+            # Full rollback is safer for syntax disasters mid-feature
             _safe_rollback(state)
-            for step in state.plan:
-                if step.status != "skipped":
-                    step.status = "pending"
-            state.note(f"retrying execute ({state.retry_count})")
+            if state.failed_step_id:
+                for step in state.plan:
+                    if step.id == state.failed_step_id:
+                        step.status = "pending"
+                    elif step.status == "failed":
+                        step.status = "pending"
+            else:
+                for step in state.plan:
+                    if step.status != "skipped":
+                        step.status = "pending"
+            state.note(
+                f"retrying execute ({state.retry_count}) "
+                f"(focus step={state.failed_step_id or 'all'})"
+            )
             return
         if state.replan_count < state.max_replans:
             state.replan_count += 1
             _safe_rollback(state)
+            state.failed_step_id = None
             state.note("replanning after edit failures")
             state.phase = Phase.PLAN
             return
@@ -214,13 +255,12 @@ def handle_verify(state: AgentState) -> None:
         state.repo_path,
         touched,
         state.stack_hints,
-        run_tests=state.run_tests,
+        run_tests=False,  # tests deferred to BEHAVIOR when --run-tests
     )
     state.verify_result = result.as_text()
     state.note(state.verify_result.splitlines()[0] if state.verify_result else "verify done")
 
     if result.ok:
-        # Syntax OK → cross-file consistency over changed files + neighbors
         state.phase = Phase.CONSISTENCY
         return
 
@@ -246,33 +286,28 @@ def handle_verify(state: AgentState) -> None:
 
 
 def handle_consistency(state: AgentState, *, client: Any = None) -> None:
-    """
-    After syntax verify: inspect changed files and their graph neighbors
-    for cross-file mistakes (missing exports, wrong handler names, etc.).
-    """
+    """Cross-file wiring: changed files + file-graph neighbors."""
     state.note("consistency check (changed files + graph neighbors)")
     touched = list(dict.fromkeys(h.path for h in state.applied_edits))
-
-    # Refresh graph so new requires are visible when possible
     root = Path(state.repo_path)
+
     scope_seeds = list(dict.fromkeys(touched + state.relevant_files))[:250]
     if scope_seeds:
         try:
-            from agent.discovery.graph import build_dependency_graph
-
-            # Merge with existing graph rather than drop unrelated edges
             fresh = build_dependency_graph(
                 root,
                 list(dict.fromkeys(list(state.graph.keys()) + scope_seeds))[:400],
             )
             state.graph = fresh
+            state.symbol_graph = build_symbol_graph(
+                root,
+                list(dict.fromkeys(list(state.candidates[:200]) + scope_seeds))[:400],
+            )
         except Exception as exc:  # noqa: BLE001
             state.note(f"graph refresh skipped: {exc}")
 
-    import os
-
-    # Prefer LLM review when a client or API key is available; always run static checks
-    use_llm = client is not None or bool(os.environ.get("GROQ_API_KEY"))
+    # LLM consistency only with --deep-review (speed default: static only)
+    use_llm = bool(state.deep_review) and not state.fast
     result = check_consistency(
         root,
         touched,
@@ -293,19 +328,15 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
         state.note(issue.message)
 
     if result.ok:
-        state.phase = Phase.SUMMARIZE
+        state.phase = Phase.BEHAVIOR
         return
 
-    # Feed precise issues back into execute so the model can fix wiring
     state.last_error = (
         "Cross-file consistency check failed. Fix these without breaking other behavior:\n"
         + result.as_text()
     )
-
     if state.retry_count < state.max_execute_retries:
         state.retry_count += 1
-        # Do NOT full-rollback good work if only wiring is wrong — keep files,
-        # re-run execute with error context so the model can patch names.
         for step in state.plan:
             if step.status != "skipped":
                 step.status = "pending"
@@ -325,8 +356,60 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
     state.phase = Phase.FAILED
 
 
+def handle_behavior(state: AgentState, *, client: Any = None) -> None:
+    """Field plumbing + optional acceptance LLM + optional project tests."""
+    state.note("behavior check (field plumbing / acceptance)")
+    touched = list(dict.fromkeys(h.path for h in state.applied_edits))
+    use_llm = bool(state.deep_review) and not state.fast
+
+    result = check_behavior(
+        state.repo_path,
+        task=state.task,
+        touched=touched,
+        backups=state.backups,
+        candidates=state.candidates,
+        stack_hints=state.stack_hints,
+        run_tests=state.run_tests,
+        use_llm=use_llm,
+        model=state.model,
+        client=client,
+        symbol_graph=state.symbol_graph,  # type: ignore[arg-type]
+    )
+    state.behavior_result = result.as_text()
+    state.note("behavior PASS" if result.ok else "behavior FAIL")
+    for line in result.messages[:10]:
+        state.note(line)
+
+    if result.ok:
+        state.phase = Phase.SUMMARIZE
+        return
+
+    state.last_error = (
+        "Behavior / acceptance check failed. Fix these functional gaps:\n"
+        + result.as_text()
+    )
+    if state.retry_count < state.max_execute_retries:
+        state.retry_count += 1
+        for step in state.plan:
+            if step.status != "skipped":
+                step.status = "pending"
+        state.note(
+            f"behavior failed; retry execute with fix context "
+            f"({state.retry_count}/{state.max_execute_retries})"
+        )
+        state.phase = Phase.EXECUTE
+        return
+
+    if state.replan_count < state.max_replans:
+        state.replan_count += 1
+        state.note("behavior failed; replanning")
+        state.phase = Phase.PLAN
+        return
+
+    state.phase = Phase.FAILED
+
+
 def handle_summarize(state: AgentState) -> None:
-    # Mark DONE first so the report status is SUCCESS
     state.phase = Phase.DONE
     state.summary = build_summary(state)
     state.note("summarized")

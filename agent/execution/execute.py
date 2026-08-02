@@ -106,6 +106,60 @@ def _looks_like_code(text: str) -> bool:
     return any(s in text for s in code_signals)
 
 
+def _load_file_for_prompt(root: Path, rel: str) -> tuple[str, int]:
+    full = root / rel
+    if not full.is_file():
+        return "(file does not exist yet)", 0
+    try:
+        raw = full.read_text(encoding="utf-8", errors="replace")
+        size_lines = len(raw.splitlines())
+        if size_lines > 250:
+            return excerpt_for_prompt(full, max_lines=180), size_lines
+        return read_line_numbered(full), size_lines
+    except OSError as exc:
+        return f"(unreadable: {exc})", 0
+
+
+def _related_files_for_step(state: AgentState, step: PlanStep, *, limit: int = 4) -> list[str]:
+    """File-graph neighbors + symbol-related files for execute context."""
+    from agent.discovery.graph import neighbors
+
+    related: list[str] = []
+    seeds = list(step.files)
+    if state.graph and seeds:
+        for n in neighbors(state.graph, seeds, hops=1):
+            if n not in seeds and n not in related:
+                related.append(n)
+
+    # Symbol graph: files of related exports / schema
+    sg = state.symbol_graph
+    if sg is not None and hasattr(sg, "symbols"):
+        seed_ids = [
+            sid
+            for sid, sym in sg.symbols.items()  # type: ignore[attr-defined]
+            if sym.file in step.files
+        ]
+        if seed_ids and hasattr(sg, "related"):
+            for sid in sg.related(seed_ids, hops=1)[:20]:  # type: ignore[attr-defined]
+                sym = sg.symbols.get(sid)  # type: ignore[attr-defined]
+                if sym and sym.file not in step.files and sym.file not in related:
+                    related.append(sym.file)
+
+    # Prefer model/controller/routes ordering
+    def rank(p: str) -> tuple[int, str]:
+        pl = p.lower()
+        if "model" in pl:
+            return (0, p)
+        if "controller" in pl:
+            return (1, p)
+        if "route" in pl:
+            return (2, p)
+        return (3, p)
+
+    related = sorted(related, key=rank)
+    return related[:limit]
+
+
 def propose_edits(
     state: AgentState,
     step: PlanStep,
@@ -119,21 +173,15 @@ def propose_edits(
     files_content: dict[str, str] = {}
     line_counts: dict[str, int] = {}
 
-    for rel in step.files:
-        full = root / rel
-        if full.is_file():
-            try:
-                raw = full.read_text(encoding="utf-8", errors="replace")
-                size_lines = len(raw.splitlines())
-                line_counts[rel] = size_lines
-                if size_lines > 250:
-                    files_content[rel] = excerpt_for_prompt(full, max_lines=220)
-                else:
-                    files_content[rel] = read_line_numbered(full)
-            except OSError as exc:
-                files_content[rel] = f"(unreadable: {exc})"
-        else:
-            files_content[rel] = "(file does not exist yet)"
+    primary = list(step.files)
+    related = _related_files_for_step(state, step)
+    for rel in primary + related:
+        if rel in files_content:
+            continue
+        content, n = _load_file_for_prompt(root, rel)
+        files_content[rel] = content
+        if n:
+            line_counts[rel] = n
 
     counts_note = ", ".join(f"{p}={n} lines" for p, n in line_counts.items())
     extra_parts: list[str] = []
@@ -155,12 +203,21 @@ def propose_edits(
         )
     extra_error = "\n".join(extra_parts) if extra_parts else None
 
+    related_note = None
+    if related:
+        related_note = (
+            "Related files included for context (via dependency/symbol graph): "
+            + ", ".join(related)
+            + ". If you add a schema field, update create/update writers here too."
+        )
+
     user = execute_user_prompt(
         task=state.task,
         step_description=step.description,
         action=step.action,
         files_content=files_content,
         last_error=extra_error,
+        related_note=related_note,
     )
 
     data = chat_json(

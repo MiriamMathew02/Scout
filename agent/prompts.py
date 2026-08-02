@@ -41,6 +41,9 @@ Keep 2-6 steps. Each step must change source code files (model, controller, rout
 Do NOT include steps like restarting the server, installing packages, running commands, or manual ops.
 Prefer modifying existing files over creating new ones when appropriate.
 Every step must be implementable by editing files only.
+If you add a model/schema field (e.g. tags), you MUST also plan updates to create/update
+(or equivalent writers) so the field is actually persisted — not only search/read paths.
+Match existing API route prefixes (do not invent /api/... if the app uses /notes).
 """
 )
 
@@ -73,6 +76,11 @@ Rules:
 - end_line must not exceed the file's last line number shown in the prompt.
 - Returning {"edits": []} is only allowed if the step is already fully implemented in the given files.
 - For implement steps (add fields, search, routes, etc.) you MUST return at least one edit.
+- Related files may be included for context: if you add a schema field, also update
+  writers (create/update) in those related files in the same response when needed.
+- Prefer $and (or equivalent) when combining independent filters (text query AND tags),
+  unless the task explicitly wants OR.
+- Keep new routes on the same path prefix as existing routes in the file.
 """
 )
 
@@ -145,19 +153,22 @@ def execute_user_prompt(
     action: str,
     files_content: dict[str, str],
     last_error: str | None = None,
+    related_note: str | None = None,
 ) -> str:
     parts = []
     for path, content in files_content.items():
         parts.append(f"===== {path} =====\n{content}")
     files_block = "\n\n".join(parts) if parts else "(no existing file content; create if needed)"
     err = f"\nFix this error from a previous attempt:\n{last_error}\n" if last_error else ""
+    related = f"\n{related_note}\n" if related_note else ""
     return f"""Overall task:
 {task}
 
 Current plan step ({action}):
 {step_description}
-
+{related}
 Implement this step now by editing the files below. Output JSON with a non-empty "edits" array unless the step is already done in the code.
+You may edit any of the listed files (primary or related) if needed for a correct feature.
 
 Files (line-numbered; use the numbers before '|' as start_line/end_line):
 {files_block}
