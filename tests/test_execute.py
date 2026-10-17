@@ -16,7 +16,7 @@ def test_long_file_shows_the_lines_the_step_mentions(tmp_path: Path):
     text, n, shown = _load_file_for_prompt(tmp_path, "big.py", hints="set x290 to zero")
     assert n == 300
     assert "290|x290 = 290" in text
-    assert shown[0] <= 290 <= shown[1]
+    assert any(a <= 290 <= b for a, b in shown)
 
 
 def test_edit_outside_shown_lines_reprompts_with_that_region(tmp_path: Path, fake_llm):
@@ -84,3 +84,17 @@ def test_files_outside_the_repo_are_not_shown_or_edited(tmp_path: Path):
             root=repo,
             step=step,
         )
+
+
+def test_edits_in_two_distant_regions_are_accepted(tmp_path: Path, fake_llm):
+    (tmp_path / "big.py").write_text("".join(f"x{i} = {i}\n" for i in range(1, 501)), encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="t")
+    step = PlanStep(id="1", description="zero two values", files=["big.py"])
+    llm = fake_llm(lambda prompt: {"edits": [
+        {"path": "big.py", "start_line": 20, "end_line": 20, "new_text": "x20 = 0\n"},
+        {"path": "big.py", "start_line": 450, "end_line": 450, "new_text": "x450 = 0\n"},
+    ]})
+    hunks = propose_edits(state, step, client=llm)
+    assert [h.start_line for h in hunks] == [20, 450]
+    assert len(llm.prompts) == 2
+    assert "\n20|x20 = 20\n" in llm.prompts[1] and "\n450|x450 = 450\n" in llm.prompts[1]
