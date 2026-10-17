@@ -53,6 +53,16 @@ def _queue_repair_step(state: AgentState, files: list[str], check: str) -> None:
 
 def run_agent(state: AgentState, *, client: Any = None) -> AgentState:
     """Run discover → plan → execute → verify → consistency → behavior → summarize."""
+    try:
+        return _run_phases(state, client=client)
+    except BaseException:
+        # Ctrl+C (KeyboardInterrupt is not an Exception) or a crash outside the
+        # phase handlers: backups live only in memory, so restore files now
+        _safe_rollback(state)
+        raise
+
+
+def _run_phases(state: AgentState, *, client: Any = None) -> AgentState:
     handlers: dict[Phase, Handler] = {
         Phase.DISCOVER: lambda s: handle_discover(s, client=client),
         Phase.PLAN: lambda s: handle_plan(s, client=client),

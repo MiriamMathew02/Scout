@@ -1,4 +1,12 @@
-from agent.loop import handle_consistency, handle_execute, handle_summarize, handle_verify
+import pytest
+
+from agent.loop import (
+    handle_consistency,
+    handle_execute,
+    handle_summarize,
+    handle_verify,
+    run_agent,
+)
 from agent.state import AgentState, EditHunk, Phase, PlanStep
 
 
@@ -150,3 +158,20 @@ def test_failed_step_retry_keeps_earlier_steps(tmp_path, fake_llm):
     assert a.read_text(encoding="utf-8") == "x = 2\n"
     assert [s.status for s in state.plan] == ["done", "pending"]
     assert state.retry_count == 1
+
+
+def test_ctrl_c_rolls_back_edits(tmp_path, monkeypatch):
+    f = tmp_path / "a.py"
+    f.write_text("x = 2\n", encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="t")
+    state.phase = Phase.VERIFY
+    state.applied_edits = [EditHunk(path="a.py", start_line=1, end_line=1, new_text="x = 2\n")]
+    state.backups = {"a.py": "x = 1\n"}
+
+    def interrupt(_state):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("agent.loop.handle_verify", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_agent(state)
+    assert f.read_text(encoding="utf-8") == "x = 1\n"
