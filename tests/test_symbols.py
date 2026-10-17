@@ -105,3 +105,25 @@ def test_schema_option_keys_and_comments_are_not_fields():
         "}, { timestamps: true })"
     )
     assert _schema_fields_in_text(text) == ["postedAt", "author"]
+
+
+def test_schema_brackets_in_comments_and_strings_are_ignored():
+    text = (
+        "mongoose.Schema({\n"
+        "  // Values (editable\n"
+        "  title: { type: String, default: \"} oops, {\" },\n"
+        "  /* see docs ( */ tags: [String],\n"
+        "  url: { type: String, default: 'http://x' }\n"
+        "})"
+    )
+    assert _schema_fields_in_text(text) == ["title", "tags", "url"]
+
+
+def test_new_field_below_a_comment_is_detected(tmp_path: Path):
+    old = "const S = mongoose.Schema({\n  // Values (editable\n  title: String\n});\n"
+    (tmp_path / "model.js").write_text(
+        "const S = mongoose.Schema({\n  // Values (editable\n  title: String,\n  tags: [String]\n});\n",
+        encoding="utf-8",
+    )
+    added = detect_added_schema_fields(tmp_path, backups={"model.js": old}, touched_files=["model.js"])
+    assert added == ["tags"]

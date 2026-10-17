@@ -206,6 +206,7 @@ def _top_level_keys(text: str, start: int) -> list[str]:
     """Keys of the object literal whose body begins at text[start], just after its '{'.
 
     Counts brackets so nested options like `{ type: String, default: Date }` are skipped.
+    Brackets and commas inside comments and strings are ignored.
     """
     keys: list[str] = []
 
@@ -215,10 +216,26 @@ def _top_level_keys(text: str, start: int) -> list[str]:
             keys.append(m.group(1))
 
     depth = 0
-    seg_start = start
-    for i in range(start, len(text)):
+    seg_start = i = start
+    quote = ""
+    while i < len(text):
         ch = text[i]
-        if ch in "{[(":
+        if quote:  # inside a string: only its closing quote matters
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end == -1 else end
+            continue
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end == -1 else end + 2
+            continue
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in "{[(":
             depth += 1
         elif ch in "}])":
             if depth == 0:  # end of the schema object
@@ -228,6 +245,7 @@ def _top_level_keys(text: str, start: int) -> list[str]:
         elif ch == "," and depth == 0:
             add(text[seg_start:i])
             seg_start = i + 1
+        i += 1
     return keys
 
 
