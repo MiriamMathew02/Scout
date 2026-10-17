@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agent.execution.execute import _load_file_for_prompt, propose_edits
+from agent.execution.execute import _load_file_for_prompt, _parse_hunks, propose_edits
 from agent.state import AgentState, PlanStep
 
 
@@ -28,3 +28,14 @@ def test_edit_outside_shown_lines_reprompts_with_that_region(tmp_path: Path, fak
     assert "\n20|x20 = 20\n" not in llm.prompts[0]
     assert "\n20|x20 = 20\n" in llm.prompts[1]
     assert [(h.start_line, h.end_line) for h in hunks] == [(20, 20)]
+
+
+def test_edit_to_dotfile_keeps_its_path(tmp_path: Path):
+    (tmp_path / ".eslintrc.js").write_text("module.exports = {};\n", encoding="utf-8")
+    step = PlanStep(id="1", description="d", files=[".eslintrc.js"])
+    hunks = _parse_hunks(
+        [{"path": "./.eslintrc.js", "start_line": 1, "end_line": 1, "new_text": "module.exports = { root: true };\n"}],
+        root=tmp_path,
+        step=step,
+    )
+    assert hunks[0].path == ".eslintrc.js"

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.discovery.heuristics import _task_tokens
+from agent.discovery.scan import clean_rel_path
 from agent.discovery.snippets import excerpt_for_prompt, read_line_numbered
 from agent.execution.atomic_edit import EditError, apply_edits, read_exact, rollback_edits
 from agent.execution.sanitize import validate_and_sanitize_hunks
@@ -43,7 +44,7 @@ def _parse_hunks(
     for item in raw_edits:
         if not isinstance(item, dict):
             continue
-        path = str(item.get("path", "")).replace("\\", "/").lstrip("./")
+        path = clean_rel_path(str(item.get("path", "")))
         if not path:
             continue
         try:

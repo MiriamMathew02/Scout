@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.discovery.graph import topological_edit_order
+from agent.discovery.scan import clean_rel_path
 from agent.llm import chat_json
 from agent.prompts import PLAN_SYSTEM, plan_user_prompt
 from agent.state import AgentState, PlanStep
@@ -45,7 +46,7 @@ def create_plan(state: AgentState, *, client: Any = None) -> list[PlanStep]:
         files = item.get("files") or []
         if isinstance(files, str):
             files = [files]
-        files = [str(f).replace("\\", "/").lstrip("./") for f in files]
+        files = [clean_rel_path(str(f)) for f in files]
         action = str(item.get("action", "modify")).lower()
         if action not in {"modify", "create", "delete"}:
             action = "modify"

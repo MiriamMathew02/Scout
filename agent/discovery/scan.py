@@ -76,6 +76,17 @@ def scan_file_tree(
     return paths, tree_text
 
 
+def clean_rel_path(path: str) -> str:
+    """Normalize a model-supplied path: forward slashes, no leading '/', './' or '../'.
+
+    Unlike lstrip("./"), this keeps the dot in names like .github/ or .eslintrc.js.
+    """
+    parts = path.replace("\\", "/").split("/")
+    while parts and parts[0] in ("", ".", ".."):
+        parts.pop(0)
+    return "/".join(parts)
+
+
 def _format_tree(paths: list[str], *, max_entries: int) -> str:
     """Compact path list suitable for prompts."""
     if not paths:
