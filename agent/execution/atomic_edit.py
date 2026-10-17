@@ -17,7 +17,7 @@ def apply_hunk(
     hunk: EditHunk,
     *,
     dry_run: bool = False,
-    backups: dict[str, str] | None = None,
+    backups: dict[str, str | None] | None = None,
     allow_create: bool = True,
 ) -> str:
     """
@@ -49,7 +49,8 @@ def apply_hunk(
         lines = original.splitlines(keepends=True)
 
     if backups is not None and rel not in backups:
-        backups[rel] = original
+        # None marks a file that did not exist yet; "" is an existing empty file
+        backups[rel] = original if path.exists() else None
 
     # Normalize line endings in new_text to match file (default \n)
     eol = "\r\n" if "\r\n" in original else "\n"
@@ -97,7 +98,7 @@ def apply_edits(
     hunks: list[EditHunk],
     *,
     dry_run: bool = False,
-    backups: dict[str, str] | None = None,
+    backups: dict[str, str | None] | None = None,
 ) -> list[str]:
     """
     Apply multiple hunks. Within each file, apply bottom-to-top so line
@@ -130,13 +131,13 @@ def apply_edits(
     return summaries
 
 
-def rollback_edits(repo_root: Path | str, backups: dict[str, str]) -> list[str]:
-    """Restore files from in-memory backups. Empty string means delete created file."""
+def rollback_edits(repo_root: Path | str, backups: dict[str, str | None]) -> list[str]:
+    """Restore files from in-memory backups. None means the file was created, so delete it."""
     root = Path(repo_root).resolve()
     restored: list[str] = []
     for rel, content in backups.items():
         path = _safe_path(root, rel)
-        if content == "":
+        if content is None:
             if path.exists():
                 path.unlink()
                 # clean empty parents optionally — skip for safety

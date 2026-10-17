@@ -73,7 +73,7 @@ class AgentState:
 
     plan: list[PlanStep] = field(default_factory=list)
     applied_edits: list[EditHunk] = field(default_factory=list)
-    backups: dict[str, str] = field(default_factory=dict)
+    backups: dict[str, str | None] = field(default_factory=dict)  # None: file was created
     last_error: str | None = None
     retry_count: int = 0
     replan_count: int = 0

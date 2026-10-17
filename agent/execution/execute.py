@@ -328,13 +328,10 @@ def run_plan_step(
 
     touched = list(dict.fromkeys(h.path for h in hunks))
     # Snapshot pre-step content so a bad step does not wipe earlier good steps
-    pre_step: dict[str, str] = {}
+    pre_step: dict[str, str | None] = {}
     for rel in touched:
         path = root / rel
-        if path.is_file():
-            pre_step[rel] = read_exact(path)
-        else:
-            pre_step[rel] = ""
+        pre_step[rel] = read_exact(path) if path.is_file() else None
 
     try:
         summaries = apply_edits(

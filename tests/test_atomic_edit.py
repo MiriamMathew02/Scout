@@ -100,3 +100,22 @@ def test_rollback_restores_exact_bytes(tmp_path: Path):
     f.write_text("x = 1\n", encoding="utf-8")
     rollback_edits(tmp_path, snapshot)
     assert f.read_bytes() == data
+
+
+def test_rollback_keeps_existing_empty_file(tmp_path: Path):
+    f = tmp_path / "__init__.py"
+    f.write_text("", encoding="utf-8")
+    backups: dict[str, str | None] = {}
+    apply_hunk(tmp_path, EditHunk(path="__init__.py", start_line=1, end_line=0, new_text="x = 1\n"),
+               backups=backups)
+    rollback_edits(tmp_path, backups)
+    assert f.exists() and f.read_bytes() == b""
+
+
+def test_rollback_deletes_file_the_run_created(tmp_path: Path):
+    backups: dict[str, str | None] = {}
+    apply_hunk(tmp_path, EditHunk(path="new.py", start_line=1, end_line=0, new_text="x = 1\n"),
+               backups=backups)
+    assert backups == {"new.py": None}
+    rollback_edits(tmp_path, backups)
+    assert not (tmp_path / "new.py").exists()

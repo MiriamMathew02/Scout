@@ -52,7 +52,7 @@ def check_behavior(
     *,
     task: str,
     touched: list[str],
-    backups: dict[str, str],
+    backups: dict[str, str | None],
     candidates: list[str],
     stack_hints: Any = None,
     run_tests: bool = False,
@@ -136,7 +136,7 @@ def _prefix_bucket(p: str) -> str:
 def _check_route_prefix_consistency(
     root: Path,
     touched: list[str],
-    backups: dict[str, str],
+    backups: dict[str, str | None],
     candidates: list[str],
 ) -> str | None:
     """Flag routes added in this run on '/x' when other routes use '/api/x', or the reverse.
@@ -155,7 +155,7 @@ def _check_route_prefix_consistency(
             current = _route_paths(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        before = _route_paths(backups.get(rel, "")) if rel in touched else current
+        before = _route_paths(backups.get(rel) or "") if rel in touched else current
         old_buckets |= {_prefix_bucket(p) for p in before}
         new_paths += [p for p in current if p not in before]
 

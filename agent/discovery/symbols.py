@@ -168,7 +168,7 @@ def check_schema_field_plumbing(
 
 def detect_added_schema_fields(
     repo_root: Path | str,
-    backups: dict[str, str],
+    backups: dict[str, str | None],
     touched_files: list[str],
 ) -> list[str]:
     """Compare backups vs current content to find new schema field names."""
@@ -184,7 +184,7 @@ def detect_added_schema_fields(
             current = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        old = backups.get(rel, "")
+        old = backups.get(rel) or ""
         old_fields = set(_schema_fields_in_text(old)) if old else set()
         new_fields = set(_schema_fields_in_text(current))
         for f in sorted(new_fields - old_fields):
