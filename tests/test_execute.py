@@ -39,3 +39,14 @@ def test_edit_to_dotfile_keeps_its_path(tmp_path: Path):
         step=step,
     )
     assert hunks[0].path == ".eslintrc.js"
+
+
+def test_short_python_edit_is_kept(tmp_path: Path):
+    (tmp_path / "m.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    step = PlanStep(id="1", description="d", files=["m.py"])
+    hunks = _parse_hunks(
+        [{"path": "m.py", "start_line": 2, "end_line": 2, "new_text": "    print('hi')\n"}],
+        root=tmp_path,
+        step=step,
+    )
+    assert [h.new_text for h in hunks] == ["    print('hi')\n"]

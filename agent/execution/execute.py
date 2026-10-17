@@ -42,8 +42,6 @@ def _parse_hunks(
             new_text = ""
         if not isinstance(new_text, str):
             new_text = str(new_text)
-        if new_text.strip() and not _looks_like_code(new_text) and len(new_text) < 40:
-            continue
         rationale = str(item.get("rationale", "") or "")
 
         full = root / path
@@ -67,30 +65,6 @@ def _parse_hunks(
             )
         )
     return hunks
-
-
-def _looks_like_code(text: str) -> bool:
-    code_signals = (
-        "{",
-        "}",
-        ";",
-        "=",
-        "function",
-        "const ",
-        "let ",
-        "var ",
-        "def ",
-        "class ",
-        "import ",
-        "require(",
-        "module.exports",
-        "exports.",
-        "return ",
-        "=>",
-        "/*",
-        "//",
-    )
-    return any(s in text for s in code_signals)
 
 
 def _guess_focus_line(lines: list[str], hints: str) -> int | None:
