@@ -7,7 +7,7 @@ from typing import Any
 
 from agent.discovery.heuristics import _task_tokens
 from agent.discovery.snippets import excerpt_for_prompt, read_line_numbered
-from agent.execution.atomic_edit import EditError, apply_edits, rollback_edits
+from agent.execution.atomic_edit import EditError, apply_edits, read_exact, rollback_edits
 from agent.execution.sanitize import validate_and_sanitize_hunks
 from agent.llm import chat_json
 from agent.prompts import EXECUTE_SYSTEM, execute_user_prompt
@@ -330,7 +330,7 @@ def run_plan_step(
                 summaries.append(f"{rel}: already absent")
                 continue
             if state.backups is not None and rel not in state.backups:
-                state.backups[rel] = path.read_text(encoding="utf-8", errors="replace")
+                state.backups[rel] = read_exact(path)
             if not state.dry_run:
                 path.unlink()
             summaries.append(f"{rel}: deleted")
@@ -366,7 +366,7 @@ def run_plan_step(
     for rel in touched:
         path = root / rel
         if path.is_file():
-            pre_step[rel] = path.read_text(encoding="utf-8", errors="replace")
+            pre_step[rel] = read_exact(path)
         else:
             pre_step[rel] = ""
 

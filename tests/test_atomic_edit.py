@@ -1,6 +1,14 @@
 from pathlib import Path
 
-from agent.execution.atomic_edit import apply_edits, apply_hunk, rollback_edits
+import pytest
+
+from agent.execution.atomic_edit import (
+    EditError,
+    apply_edits,
+    apply_hunk,
+    read_exact,
+    rollback_edits,
+)
 from agent.state import EditHunk
 
 
@@ -51,3 +59,44 @@ def test_create_file(tmp_path: Path):
         EditHunk(path="new.py", start_line=1, end_line=0, new_text="print(1)\n"),
     )
     assert (tmp_path / "new.py").read_text(encoding="utf-8") == "print(1)\n"
+
+
+def test_edit_keeps_crlf_line_endings(tmp_path: Path):
+    f = tmp_path / "w.py"
+    f.write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+    backups: dict[str, str] = {}
+    apply_hunk(
+        tmp_path,
+        EditHunk(path="w.py", start_line=2, end_line=2, new_text="b = 20\n"),
+        backups=backups,
+    )
+    assert f.read_bytes() == b"a = 1\r\nb = 20\r\nc = 3\r\n"
+    rollback_edits(tmp_path, backups)
+    assert f.read_bytes() == b"a = 1\r\nb = 2\r\nc = 3\r\n"
+
+
+def test_edit_keeps_lf_line_endings(tmp_path: Path):
+    # On Windows, write_text used to turn every \n into \r\n
+    f = tmp_path / "a.py"
+    f.write_bytes(b"one\ntwo\n")
+    apply_hunk(tmp_path, EditHunk(path="a.py", start_line=2, end_line=2, new_text="TWO\n"))
+    assert f.read_bytes() == b"one\nTWO\n"
+
+
+def test_refuses_to_rewrite_non_utf8_file(tmp_path: Path):
+    f = tmp_path / "l.py"
+    data = "a = 1\nname = 'Jos\xe9'\n".encode("latin-1")
+    f.write_bytes(data)
+    with pytest.raises(EditError, match="UTF-8"):
+        apply_hunk(tmp_path, EditHunk(path="l.py", start_line=1, end_line=1, new_text="a = 2\n"))
+    assert f.read_bytes() == data
+
+
+def test_rollback_restores_exact_bytes(tmp_path: Path):
+    f = tmp_path / "l.py"
+    data = "name = 'Jos\xe9'\r\n".encode("latin-1")
+    f.write_bytes(data)
+    snapshot = {"l.py": read_exact(f)}
+    f.write_text("x = 1\n", encoding="utf-8")
+    rollback_edits(tmp_path, snapshot)
+    assert f.read_bytes() == data

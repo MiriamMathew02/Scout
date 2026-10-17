@@ -40,18 +40,19 @@ def apply_hunk(
         original = ""
         lines: list[str] = []
     else:
-        original = path.read_text(encoding="utf-8", errors="replace")
+        # Bytes, not read_text: no newline translation, so untouched lines stay exact
+        try:
+            original = path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise EditError(f"{rel}: not valid UTF-8; refusing to rewrite it") from exc
         lines = original.splitlines(keepends=True)
 
     if backups is not None and rel not in backups:
         backups[rel] = original
 
     # Normalize line endings in new_text to match file (default \n)
-    new_block = hunk.new_text
-    if new_block and not new_block.endswith("\n") and "\n" in new_block:
-        # keep as-is for partial mid-line replacements; splitlines handles content
-        pass
-    new_lines = _to_lines(new_block)
+    eol = "\r\n" if "\r\n" in original else "\n"
+    new_lines = [line.rstrip("\r\n") + eol for line in _to_lines(hunk.new_text)]
 
     n = len(lines)
     start = hunk.start_line
@@ -79,13 +80,13 @@ def apply_hunk(
     new_content = "".join(result_lines)
     # Ensure trailing newline for non-empty text files (common convention)
     if new_content and not new_content.endswith("\n"):
-        new_content += "\n"
+        new_content += eol
 
     summary = _diff_summary(rel, start, end, hunk.new_text)
 
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(new_content, encoding="utf-8")
+        path.write_bytes(new_content.encode("utf-8"))
 
     return summary
 
@@ -141,9 +142,14 @@ def rollback_edits(repo_root: Path | str, backups: dict[str, str]) -> list[str]:
                 restored.append(f"deleted created file {rel}")
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            path.write_bytes(content.encode("utf-8", errors="surrogateescape"))
             restored.append(f"restored {rel}")
     return restored
+
+
+def read_exact(path: Path) -> str:
+    """File text with its line endings and any non-UTF-8 bytes kept, for exact restores."""
+    return path.read_bytes().decode("utf-8", errors="surrogateescape")
 
 
 def _safe_path(root: Path, rel: str) -> Path:
