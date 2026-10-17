@@ -58,15 +58,17 @@ class ConsistencyResult:
     ok: bool
     issues: list[ConsistencyIssue] = field(default_factory=list)
     scope_files: list[str] = field(default_factory=list)
+    review_error: str | None = None  # set when the LLM review was asked for but did not complete
 
     def as_text(self) -> str:
+        note = f"\nLLM consistency review did not complete: {self.review_error}" if self.review_error else ""
         if self.ok:
             scope = ", ".join(self.scope_files[:12]) or "(none)"
-            return f"PASS\nConsistency OK over: {scope}"
+            return f"PASS\nConsistency OK over: {scope}{note}"
         lines = ["FAIL", f"Checked files: {', '.join(self.scope_files)}"]
         for issue in self.issues:
             lines.append(issue.as_text())
-        return "\n".join(lines)
+        return "\n".join(lines) + note
 
 
 def files_in_consistency_scope(
@@ -121,8 +123,9 @@ def check_consistency(
         # in unusual patterns; skip LLM if static already failed (enough signal to re-execute).
         pass
 
+    review_error = None
     if use_llm and not issues and scope:
-        llm_issues = _llm_consistency_review(
+        llm_issues, review_error = _llm_consistency_review(
             root,
             scope,
             touched=touched,
@@ -135,7 +138,9 @@ def check_consistency(
         # Static already failed — skip LLM, return static issues for repair
         pass
 
-    return ConsistencyResult(ok=len(issues) == 0, issues=issues, scope_files=scope)
+    return ConsistencyResult(
+        ok=len(issues) == 0, issues=issues, scope_files=scope, review_error=review_error
+    )
 
 
 def _check_js_require_exports(root: Path, scope: list[str]) -> list[ConsistencyIssue]:
@@ -470,7 +475,8 @@ def _llm_consistency_review(
     task: str,
     model: str | None,
     client: Any,
-) -> list[ConsistencyIssue]:
+) -> tuple[list[ConsistencyIssue], str | None]:
+    """Return (issues, error); error says why the review did not complete."""
     # Cap files for tokens
     files_to_show = list(dict.fromkeys(touched + scope))[:10]
     parts: list[str] = []
@@ -489,7 +495,7 @@ def _llm_consistency_review(
         parts.append(f"===== {rel} =====\n{body}")
 
     if not parts:
-        return []
+        return [], None
 
     user = (
         f"Task that was implemented:\n{task}\n\n"
@@ -508,12 +514,12 @@ def _llm_consistency_review(
             client=client,
             max_tokens=2000,
         )
-    except Exception:  # noqa: BLE001 — soft: static checks already ran
-        return []
+    except Exception as exc:  # noqa: BLE001 — soft: static checks already ran
+        return [], f"model request failed: {exc}"
 
-    raw = data.get("issues") or []
+    raw = data.get("issues")
     if not isinstance(raw, list):
-        return []
+        return [], "reply had no 'issues' list"
     out: list[ConsistencyIssue] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -530,4 +536,4 @@ def _llm_consistency_review(
                 symbol=str(item.get("symbol") or ""),
             )
         )
-    return out
+    return out, None

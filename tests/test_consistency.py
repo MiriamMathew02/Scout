@@ -141,3 +141,13 @@ def test_deleting_an_unused_module_passes(tmp_path: Path):
         tmp_path, touched=["old.py"], graph=graph, use_llm=False, deleted=["old.py"]
     )
     assert result.ok
+
+
+def test_failed_consistency_review_is_reported(tmp_path: Path, fake_llm):
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    result = check_consistency(
+        tmp_path, touched=["a.py"], graph={"a.py": []}, use_llm=True,
+        client=fake_llm(lambda prompt: {"verdict": "fine"}),
+    )
+    assert result.ok and result.review_error == "reply had no 'issues' list"
+    assert "did not complete" in result.as_text()

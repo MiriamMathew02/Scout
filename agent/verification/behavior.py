@@ -26,6 +26,7 @@ from agent.verification.verify import verify_changes
 class BehaviorResult:
     ok: bool
     messages: list[str] = field(default_factory=list)
+    review_error: str | None = None  # set when the LLM review was asked for but did not complete
 
     def as_text(self) -> str:
         status = "PASS" if self.ok else "FAIL"
@@ -86,15 +87,18 @@ def check_behavior(
         messages.append(route_issue)
         hard_fail = True
 
+    review_error = None
     if use_llm and not hard_fail:
-        gaps = _llm_behavior_gaps(
+        gaps, review_error = _llm_behavior_gaps(
             root,
             task=task,
             touched=touched,
             model=model,
             client=client,
         )
-        if gaps:
+        if review_error:
+            messages.append(f"LLM acceptance review did not complete: {review_error}")
+        elif gaps:
             hard_fail = True
             messages.append("LLM acceptance review found gaps:")
             messages.extend(f"- {g}" for g in gaps)
@@ -111,7 +115,7 @@ def check_behavior(
         else:
             messages.append("Project tests: OK (or skipped if unavailable).")
 
-    return BehaviorResult(ok=not hard_fail, messages=messages)
+    return BehaviorResult(ok=not hard_fail, messages=messages, review_error=review_error)
 
 
 _ROUTE_DEF_RE = re.compile(
@@ -180,7 +184,8 @@ def _llm_behavior_gaps(
     touched: list[str],
     model: str | None,
     client: Any,
-) -> list[str]:
+) -> tuple[list[str], str | None]:
+    """Return (gaps, error); error says why the review did not complete."""
     from agent.discovery.snippets import read_line_numbered
     from agent.llm import DEFAULT_MODEL
 
@@ -198,7 +203,7 @@ def _llm_behavior_gaps(
             body = "\n".join(lines[:180]) + "\n..."
         parts.append(f"===== {rel} =====\n{body}")
     if not parts:
-        return []
+        return [], None
 
     user = f"Task:\n{task}\n\nChanged files:\n" + "\n\n".join(parts)
     try:
@@ -209,12 +214,15 @@ def _llm_behavior_gaps(
             client=client,
             max_tokens=1500,
         )
-    except Exception:  # noqa: BLE001
-        return []
+    except Exception as exc:  # noqa: BLE001
+        return [], f"model request failed: {exc}"
 
-    if data.get("ok") is True and not data.get("gaps"):
-        return []
+    if "ok" not in data and "gaps" not in data:
+        return [], "reply had neither 'ok' nor 'gaps'"
     gaps = data.get("gaps") or []
     if not isinstance(gaps, list):
-        return []
-    return [str(g) for g in gaps if str(g).strip()]
+        return [], "reply had no 'gaps' list"
+    gaps = [str(g) for g in gaps if str(g).strip()]
+    if data.get("ok") is False and not gaps:
+        return [], "reply said the task is not met but listed no gaps"
+    return gaps, None

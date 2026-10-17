@@ -189,3 +189,11 @@ def test_deleting_a_module_still_in_use_fails_consistency(tmp_path):
     handle_consistency(state, client=None)
     assert state.phase == Phase.EXECUTE
     assert "still imports 'helpers.py'" in (state.last_error or "")
+
+
+def test_summary_says_when_deep_review_did_not_complete():
+    state = AgentState(repo_path=".", task="t")
+    state.phase = Phase.SUMMARIZE
+    state.review_errors = ["behavior: model request failed: timeout"]
+    handle_summarize(state)
+    assert "**Deep review:** did not complete (behavior: model request failed: timeout)" in state.summary

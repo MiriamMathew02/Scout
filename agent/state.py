@@ -82,6 +82,7 @@ class AgentState:
     verify_result: str = ""
     consistency_result: str = ""
     behavior_result: str = ""
+    review_errors: list[str] = field(default_factory=list)  # deep reviews that did not complete
     summary: str = ""
     log: list[str] = field(default_factory=list)
 

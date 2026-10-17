@@ -344,6 +344,8 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
         deleted=deleted,
     )
     state.consistency_result = result.as_text()
+    if result.review_error:
+        state.review_errors.append(f"consistency: {result.review_error}")
     state.note(
         "consistency PASS"
         if result.ok
@@ -400,6 +402,8 @@ def handle_behavior(state: AgentState, *, client: Any = None) -> None:
         symbol_graph=state.symbol_graph,  # type: ignore[arg-type]
     )
     state.behavior_result = result.as_text()
+    if result.review_error:
+        state.review_errors.append(f"behavior: {result.review_error}")
     state.note("behavior PASS" if result.ok else "behavior FAIL")
     for line in result.messages[:10]:
         state.note(line)

@@ -20,6 +20,9 @@ def build_summary(state: AgentState) -> str:
     lines.append(f"**Model:** {state.model}")
     if state.dry_run:
         lines.append("**Mode:** dry-run (no files written)")
+    if state.review_errors:
+        reasons = "; ".join(dict.fromkeys(state.review_errors))
+        lines.append(f"**Deep review:** did not complete ({reasons})")
     lines.append("")
 
     if state.repo_summary:

@@ -90,3 +90,34 @@ def test_route_prefix_check_allows_moving_every_route(tmp_path: Path):
     new = "app.get('/api/notes', notes.list);\napp.post('/api/notes', notes.create);\n"
     result = _route_check(tmp_path, old, new)
     assert result.ok, result.messages
+
+
+class _BrokenLLM:
+    """Client whose every request fails, like a provider outage."""
+
+    def __init__(self):
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kwargs):
+        raise ConnectionError("provider unavailable")
+
+
+def test_failed_acceptance_review_is_not_reported_as_clean(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    result = check_behavior(
+        tmp_path, task="t", touched=["a.py"], backups={"a.py": "x = 0\n"},
+        candidates=["a.py"], use_llm=True, client=_BrokenLLM(),
+    )
+    assert result.review_error and "provider unavailable" in result.review_error
+    assert not any("no gaps reported" in m for m in result.messages)
+    assert any("did not complete" in m for m in result.messages)
+
+
+def test_malformed_acceptance_reply_is_not_reported_as_clean(tmp_path: Path, fake_llm):
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    result = check_behavior(
+        tmp_path, task="t", touched=["a.py"], backups={"a.py": "x = 0\n"},
+        candidates=["a.py"], use_llm=True, client=fake_llm(lambda prompt: {}),
+    )
+    assert result.review_error == "reply had neither 'ok' nor 'gaps'"
