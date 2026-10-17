@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.discovery.graph import neighbors
+from agent.discovery.graph import build_dependency_graph, neighbors
 from agent.discovery.snippets import read_line_numbered
 from agent.llm import chat_json
 
@@ -91,10 +91,12 @@ def check_consistency(
     model: str | None = None,
     task: str = "",
     client: Any = None,
+    deleted: list[str] | None = None,
 ) -> ConsistencyResult:
     """
     Static checks first (JS require/export wiring); optional LLM review
-    of the same file scope for residual mistakes.
+    of the same file scope for residual mistakes. `deleted` lists files this
+    run removed; any file that still imports one of them is an issue.
     """
     root = Path(repo_root).resolve()
     scope = files_in_consistency_scope(touched, graph, hops=hops)
@@ -106,6 +108,9 @@ def check_consistency(
     issues: list[ConsistencyIssue] = []
     issues.extend(_check_js_require_exports(root, scope))
     issues.extend(_check_python_imports(root, scope))
+    if deleted:
+        files = list(dict.fromkeys(list(graph.keys()) + scope))
+        issues.extend(check_deleted_references(root, deleted, files))
 
     if use_llm and not issues:
         # Only spend tokens if static checks are clean but we still want a pass
@@ -213,6 +218,33 @@ def _check_js_require_exports(root: Path, scope: list[str]) -> list[ConsistencyI
                             symbol=prop,
                         )
                     )
+    return issues
+
+
+def check_deleted_references(
+    root: Path, deleted: list[str], files: list[str]
+) -> list[ConsistencyIssue]:
+    """Files that still import a module this run deleted."""
+    gone = set(deleted)
+    # Import edges only: a test file sitting next to a deleted module is not a reference
+    graph = build_dependency_graph(root, list(dict.fromkeys(files + deleted)), structural=False)
+    issues: list[ConsistencyIssue] = []
+    for src, deps in graph.items():
+        if src in gone or not (root / src).is_file():
+            continue
+        for dep in deps:
+            if dep in gone:
+                issues.append(
+                    ConsistencyIssue(
+                        kind="deleted_module_in_use",
+                        message=(
+                            f"'{src}' still imports '{dep}', which this run deleted. "
+                            f"Update '{src}' or keep '{dep}'."
+                        ),
+                        file=src,
+                        related_file=dep,
+                    )
+                )
     return issues
 
 

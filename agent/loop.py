@@ -313,6 +313,7 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
     state.note("consistency check (changed files + graph neighbors)")
     touched = list(dict.fromkeys(h.path for h in state.applied_edits))
     root = Path(state.repo_path)
+    deleted = [t for t in touched if state.backups.get(t) is not None and not (root / t).exists()]
 
     scope_seeds = list(dict.fromkeys(touched + state.relevant_files))[:250]
     if scope_seeds:
@@ -340,6 +341,7 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
         model=state.model,
         task=state.task,
         client=client,
+        deleted=deleted,
     )
     state.consistency_result = result.as_text()
     state.note(

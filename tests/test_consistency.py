@@ -112,3 +112,32 @@ def test_python_check_flags_missing_name(tmp_path: Path):
     (pkg / "main.py").write_text("from app.config import DEBUG, MISSING\n", encoding="utf-8")
     result = _py_check(tmp_path, ["app/__init__.py", "app/config.py", "app/main.py"], "app/main.py")
     assert [i.symbol for i in result.issues] == ["MISSING"]
+
+
+def test_flags_import_of_deleted_python_module(tmp_path: Path):
+    (tmp_path / "main.py").write_text("from helpers import run\n\nrun()\n", encoding="utf-8")
+    (tmp_path / "test_helpers.py").write_text("def test_nothing():\n    pass\n", encoding="utf-8")
+    graph = {"main.py": ["helpers.py"], "helpers.py": [], "test_helpers.py": []}
+    result = check_consistency(
+        tmp_path, touched=["helpers.py"], graph=graph, use_llm=False, deleted=["helpers.py"]
+    )
+    # test_helpers.py sits next to helpers.py but doesn't import it, so it isn't flagged
+    assert [(i.file, i.related_file) for i in result.issues] == [("main.py", "helpers.py")]
+
+
+def test_flags_require_of_deleted_js_module(tmp_path: Path):
+    (tmp_path / "index.js").write_text("const h = require('./helpers');\nh.run();\n", encoding="utf-8")
+    graph = {"index.js": ["helpers.js"], "helpers.js": []}
+    result = check_consistency(
+        tmp_path, touched=["helpers.js"], graph=graph, use_llm=False, deleted=["helpers.js"]
+    )
+    assert [i.kind for i in result.issues] == ["deleted_module_in_use"]
+
+
+def test_deleting_an_unused_module_passes(tmp_path: Path):
+    (tmp_path / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    graph = {"main.py": [], "old.py": []}
+    result = check_consistency(
+        tmp_path, touched=["old.py"], graph=graph, use_llm=False, deleted=["old.py"]
+    )
+    assert result.ok

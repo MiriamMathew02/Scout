@@ -175,3 +175,17 @@ def test_ctrl_c_rolls_back_edits(tmp_path, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         run_agent(state)
     assert f.read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_deleting_a_module_still_in_use_fails_consistency(tmp_path):
+    (tmp_path / "main.py").write_text("from helpers import run\n\nrun()\n", encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="remove helpers")
+    state.phase = Phase.CONSISTENCY
+    state.plan = [PlanStep(id="1", description="delete helpers", files=["helpers.py"],
+                           action="delete", status="done")]
+    state.applied_edits = [EditHunk(path="helpers.py", start_line=1, end_line=0, new_text="")]
+    state.backups = {"helpers.py": "def run():\n    pass\n"}  # file is gone from disk
+    state.graph = {"main.py": ["helpers.py"], "helpers.py": []}
+    handle_consistency(state, client=None)
+    assert state.phase == Phase.EXECUTE
+    assert "still imports 'helpers.py'" in (state.last_error or "")

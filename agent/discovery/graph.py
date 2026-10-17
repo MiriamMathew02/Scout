@@ -11,11 +11,17 @@ from pathlib import Path
 Graph = dict[str, list[str]]
 
 
-def build_dependency_graph(repo_root: Path | str, files: list[str]) -> Graph:
+def build_dependency_graph(
+    repo_root: Path | str,
+    files: list[str],
+    *,
+    structural: bool = True,
+) -> Graph:
     """
     Build adjacency map: file -> files it depends on (within the candidate set).
 
-    Unresolved imports are dropped. Includes structural co-location edges.
+    Unresolved imports are dropped. Includes structural co-location edges
+    (tests next to their module) unless structural=False.
     """
     root = Path(repo_root).resolve()
     file_set = set(files)
@@ -50,7 +56,8 @@ def build_dependency_graph(repo_root: Path | str, files: list[str]) -> Graph:
         elif suffix == ".php":
             deps |= _php_deps(rel, text, file_set, index)
 
-        deps |= _structural_neighbors(rel, file_set)
+        if structural:
+            deps |= _structural_neighbors(rel, file_set)
         deps.discard(rel)
         graph[rel] |= deps
 
