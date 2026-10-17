@@ -17,13 +17,9 @@ from pathlib import Path
 _EXPORTS_FN_RE = re.compile(
     r"exports\.([A-Za-z_$][\w$]*)\s*=",
 )
-_SCHEMA_FIELD_RE = re.compile(
-    r"(?:^|[,{])\s*([A-Za-z_$][\w$]*)\s*:\s*(?:String|Number|Boolean|Date|Buffer|ObjectId|Map|Array|\[[^\]]*\]|\{)",
-    re.MULTILINE,
-)
-_SCHEMA_BLOCK_RE = re.compile(
-    r"(?:mongoose\.)?Schema\s*\(\s*\{([\s\S]*?)\}\s*(?:,|\))",
-)
+_SCHEMA_START_RE = re.compile(r"(?:mongoose\.)?Schema\s*\(\s*\{")
+_SCHEMA_KEY_RE = re.compile(r"""\s*['"]?([A-Za-z_$][\w$]*)['"]?\s*:""")
+_JS_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
 _ROUTE_RE = re.compile(
     r"""app\.(get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]\s*,\s*([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)""",
     re.IGNORECASE,
@@ -199,13 +195,40 @@ def detect_added_schema_fields(
 
 def _schema_fields_in_text(text: str) -> list[str]:
     fields: list[str] = []
-    for m in _SCHEMA_BLOCK_RE.finditer(text):
-        body = m.group(1)
-        for fm in _SCHEMA_FIELD_RE.finditer(body):
-            name = fm.group(1)
+    for m in _SCHEMA_START_RE.finditer(text):
+        for name in _top_level_keys(text, m.end()):
             if name not in fields:
                 fields.append(name)
     return fields
+
+
+def _top_level_keys(text: str, start: int) -> list[str]:
+    """Keys of the object literal whose body begins at text[start], just after its '{'.
+
+    Counts brackets so nested options like `{ type: String, default: Date }` are skipped.
+    """
+    keys: list[str] = []
+
+    def add(segment: str) -> None:
+        m = _SCHEMA_KEY_RE.match(_JS_COMMENT_RE.sub("", segment))
+        if m:
+            keys.append(m.group(1))
+
+    depth = 0
+    seg_start = start
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch in "{[(":
+            depth += 1
+        elif ch in "}])":
+            if depth == 0:  # end of the schema object
+                add(text[seg_start:i])
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            add(text[seg_start:i])
+            seg_start = i + 1
+    return keys
 
 
 def _sid(kind: str, name: str, file: str) -> str:
