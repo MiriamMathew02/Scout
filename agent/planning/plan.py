@@ -79,17 +79,37 @@ def create_plan(state: AgentState, *, client: Any = None) -> list[PlanStep]:
     return steps
 
 
-_OPS_KEYWORDS = (
-    "restart",
+# Phrases that mean "run an operation" rather than "edit a file". Kept specific on
+# purpose: a bare "docker" or "deploy" also matches real edits like "Update the Dockerfile".
+_OPS_PHRASES = (
+    "restart the server",
+    "restart the app",
+    "restart the service",
     "reboot",
     "install dependenc",
+    "install package",
     "npm install",
     "yarn install",
+    "pnpm install",
     "pip install",
     "run the server",
     "start the server",
-    "deploy",
+    "run docker",
+    "docker compose up",
+    "docker-compose up",
+    "deploy to production",
+    "deploy the app",
+    "redeploy",
+    "manual step",
+    "manually test",
+    "manual testing",
 )
+
+
+def is_ops_step(description: str) -> bool:
+    """True when a step asks for an operation (install, restart, deploy), not an edit."""
+    text = description.lower()
+    return any(p in text for p in _OPS_PHRASES)
 
 
 def validate_plan(state: AgentState, steps: list[PlanStep]) -> list[PlanStep]:
@@ -99,8 +119,7 @@ def validate_plan(state: AgentState, steps: list[PlanStep]) -> list[PlanStep]:
     for step in steps[:10]:
         if not step.description.strip():
             continue
-        desc_l = step.description.lower()
-        if any(k in desc_l for k in _OPS_KEYWORDS):
+        if is_ops_step(step.description):
             continue
         if not step.files and step.action != "create":
             continue

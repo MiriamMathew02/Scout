@@ -11,27 +11,12 @@ from agent.discovery.snippets import excerpt_for_prompt, read_line_numbered
 from agent.execution.atomic_edit import EditError, apply_edits, read_exact, rollback_edits
 from agent.execution.sanitize import validate_and_sanitize_hunks
 from agent.llm import chat_json
+from agent.planning.plan import is_ops_step
 from agent.prompts import EXECUTE_SYSTEM, execute_user_prompt
 from agent.state import AgentState, EditHunk, PlanStep
 from agent.verification.verify import verify_changes
 
 MAX_HUNK_FRACTION = 0.70
-_SKIP_STEP_RE = (
-    "restart",
-    "reboot",
-    "install package",
-    "npm install",
-    "yarn install",
-    "pip install",
-    "docker",
-    "deploy",
-    "manual",
-)
-
-
-def _is_noop_ops_step(step: PlanStep) -> bool:
-    text = f"{step.description} {' '.join(step.files)}".lower()
-    return any(k in text for k in _SKIP_STEP_RE)
 
 
 def _parse_hunks(
@@ -319,7 +304,7 @@ def run_plan_step(
     """Propose edits for a step, sanitize, apply, then syntax-check."""
     root = Path(state.repo_path)
 
-    if _is_noop_ops_step(step):
+    if is_ops_step(step.description):
         step.status = "skipped"
         return [f"step {step.id}: skipped non-code/ops step"]
 
