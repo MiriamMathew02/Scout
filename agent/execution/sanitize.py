@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from agent.discovery.scan import resolve_inside
-from agent.execution.atomic_edit import EditError
+from agent.execution.atomic_edit import EditError, check_overlaps
 from agent.state import EditHunk
 
 # Top-level (unindented) declarations only: names inside functions may repeat freely.
@@ -104,6 +104,7 @@ def validate_and_sanitize_hunks(
             # empty insert — drop
             continue
         result.append(h)
+    check_overlaps(result)  # raised here, the step re-prompts with the conflict
     return result
 
 

@@ -103,7 +103,9 @@ def apply_edits(
     """
     Apply multiple hunks. Within each file, apply bottom-to-top so line
     numbers stay valid relative to the original content for that batch.
+    Overlapping hunks are rejected before anything is written.
     """
+    check_overlaps(hunks)
     # Group by path preserving reverse line order
     by_path: dict[str, list[EditHunk]] = {}
     for h in hunks:
@@ -111,7 +113,9 @@ def apply_edits(
 
     summaries: list[str] = []
     for path, group in by_path.items():
-        ordered = sorted(group, key=lambda h: (h.start_line, h.end_line), reverse=True)
+        ordered = sorted(
+            _merge_inserts(group), key=lambda h: (h.start_line, h.end_line), reverse=True
+        )
         for h in ordered:
             normalized = EditHunk(
                 path=path,
@@ -129,6 +133,56 @@ def apply_edits(
                 )
             )
     return summaries
+
+
+def check_overlaps(hunks: list[EditHunk]) -> None:
+    """Raise EditError when two hunks in one file would change the same lines."""
+    by_path: dict[str, list[EditHunk]] = {}
+    for h in hunks:
+        by_path.setdefault(h.path.replace("\\", "/"), []).append(h)
+    for path, group in by_path.items():
+        replaces = sorted(
+            (h for h in group if h.end_line >= h.start_line), key=lambda h: h.start_line
+        )
+        for a, b in zip(replaces, replaces[1:]):
+            if b.start_line <= a.end_line:
+                raise EditError(
+                    f"{path}: edits to lines {a.start_line}-{a.end_line} and "
+                    f"{b.start_line}-{b.end_line} overlap; combine them into one edit"
+                )
+        for ins in (h for h in group if h.end_line < h.start_line):
+            for r in replaces:
+                if r.start_line < ins.start_line <= r.end_line:
+                    raise EditError(
+                        f"{path}: an insert before line {ins.start_line} falls inside the "
+                        f"edit to lines {r.start_line}-{r.end_line}; combine them into one edit"
+                    )
+
+
+def _merge_inserts(group: list[EditHunk]) -> list[EditHunk]:
+    """Join inserts at the same line into one hunk, in the order they were given.
+
+    Applied one by one, each would land above the previous one and reverse their order.
+    """
+    out: list[EditHunk] = []
+    at_line: dict[int, int] = {}
+    for h in group:
+        if h.end_line < h.start_line and h.start_line in at_line:
+            i = at_line[h.start_line]
+            prev = out[i]
+            first = prev.new_text if not prev.new_text or prev.new_text.endswith("\n") else prev.new_text + "\n"
+            out[i] = EditHunk(
+                path=prev.path,
+                start_line=prev.start_line,
+                end_line=prev.end_line,
+                new_text=first + h.new_text,
+                rationale=prev.rationale,
+            )
+            continue
+        if h.end_line < h.start_line:
+            at_line[h.start_line] = len(out)
+        out.append(h)
+    return out
 
 
 def rollback_edits(repo_root: Path | str, backups: dict[str, str | None]) -> list[str]:

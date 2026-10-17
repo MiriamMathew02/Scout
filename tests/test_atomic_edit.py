@@ -119,3 +119,36 @@ def test_rollback_deletes_file_the_run_created(tmp_path: Path):
     assert backups == {"new.py": None}
     rollback_edits(tmp_path, backups)
     assert not (tmp_path / "new.py").exists()
+
+
+def test_overlapping_edits_are_rejected_before_writing(tmp_path: Path):
+    f = tmp_path / "a.py"
+    f.write_text("a = 1\nb = 2\n", encoding="utf-8")
+    hunks = [
+        EditHunk(path="a.py", start_line=1, end_line=2, new_text="a = 10\nb = 20\n"),
+        EditHunk(path="a.py", start_line=2, end_line=2, new_text="b = 200\n"),
+    ]
+    with pytest.raises(EditError, match="overlap"):
+        apply_edits(tmp_path, hunks)
+    assert f.read_text(encoding="utf-8") == "a = 1\nb = 2\n"
+
+
+def test_insert_inside_a_replaced_range_is_rejected(tmp_path: Path):
+    f = tmp_path / "a.py"
+    f.write_text("a\nb\nc\n", encoding="utf-8")
+    hunks = [
+        EditHunk(path="a.py", start_line=1, end_line=3, new_text="A\nB\nC\n"),
+        EditHunk(path="a.py", start_line=2, end_line=1, new_text="mid\n"),
+    ]
+    with pytest.raises(EditError, match="falls inside"):
+        apply_edits(tmp_path, hunks)
+
+
+def test_inserts_at_the_same_line_keep_their_order(tmp_path: Path):
+    f = tmp_path / "a.py"
+    f.write_text("a\nb\n", encoding="utf-8")
+    apply_edits(tmp_path, [
+        EditHunk(path="a.py", start_line=2, end_line=1, new_text="x\n"),
+        EditHunk(path="a.py", start_line=2, end_line=1, new_text="y\n"),
+    ])
+    assert f.read_text(encoding="utf-8") == "a\nx\ny\nb\n"
