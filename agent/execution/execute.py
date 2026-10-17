@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from agent.discovery.heuristics import _task_tokens
 from agent.discovery.snippets import excerpt_for_prompt, read_line_numbered
 from agent.execution.atomic_edit import EditError, apply_edits, rollback_edits
 from agent.execution.sanitize import validate_and_sanitize_hunks
@@ -106,18 +107,52 @@ def _looks_like_code(text: str) -> bool:
     return any(s in text for s in code_signals)
 
 
-def _load_file_for_prompt(root: Path, rel: str) -> tuple[str, int]:
+def _guess_focus_line(lines: list[str], hints: str) -> int | None:
+    """1-based line mentioning the most words from the step/task, if any line does."""
+    tokens = set(_task_tokens(hints))
+    best, best_score = None, 0
+    for i, line in enumerate(lines, start=1):
+        low = line.lower()
+        score = sum(1 for t in tokens if t in low)
+        if score > best_score:
+            best, best_score = i, score
+    return best
+
+
+def _load_file_for_prompt(
+    root: Path,
+    rel: str,
+    *,
+    hints: str = "",
+    focus_line: int | None = None,
+) -> tuple[str, int, tuple[int, int] | None]:
+    """Return (prompt text, line count, shown line range or None if the whole file is shown)."""
     full = root / rel
     if not full.is_file():
-        return "(file does not exist yet)", 0
+        return "(file does not exist yet)", 0, None
     try:
         raw = full.read_text(encoding="utf-8", errors="replace")
-        size_lines = len(raw.splitlines())
+        lines = raw.splitlines()
+        size_lines = len(lines)
         if size_lines > 250:
-            return excerpt_for_prompt(full, max_lines=180), size_lines
-        return read_line_numbered(full), size_lines
+            if focus_line is None:
+                focus_line = _guess_focus_line(lines, hints)
+            if focus_line is None:
+                return excerpt_for_prompt(full, max_lines=180), size_lines, (1, 180)
+            mid = max(1, min(focus_line, size_lines))
+            shown = (max(1, mid - 90), min(size_lines, mid + 90))
+            text = excerpt_for_prompt(full, max_lines=180, focus_line=mid, window=90)
+            return text, size_lines, shown
+        return read_line_numbered(full), size_lines, None
     except OSError as exc:
-        return f"(unreadable: {exc})", 0
+        return f"(unreadable: {exc})", 0, None
+
+
+def _within(hunk: EditHunk, shown: tuple[int, int]) -> bool:
+    first, last = shown
+    if hunk.end_line < hunk.start_line:  # insert before start_line
+        return first <= hunk.start_line <= last + 1
+    return first <= hunk.start_line and hunk.end_line <= last
 
 
 def _related_files_for_step(state: AgentState, step: PlanStep, *, limit: int = 4) -> list[str]:
@@ -167,21 +202,30 @@ def propose_edits(
     client: Any = None,
     force: bool = False,
     bound_error: str | None = None,
+    focus: dict[str, int] | None = None,
 ) -> list[EditHunk]:
     """Ask the LLM for EditHunks for one plan step. Retries once if empty/invalid."""
     root = Path(state.repo_path)
     files_content: dict[str, str] = {}
     line_counts: dict[str, int] = {}
+    partial: dict[str, tuple[int, int]] = {}
 
     primary = list(step.files)
     related = _related_files_for_step(state, step)
     for rel in primary + related:
         if rel in files_content:
             continue
-        content, n = _load_file_for_prompt(root, rel)
+        content, n, shown = _load_file_for_prompt(
+            root,
+            rel,
+            hints=f"{step.description} {state.task}",
+            focus_line=(focus or {}).get(rel),
+        )
         files_content[rel] = content
         if n:
             line_counts[rel] = n
+        if shown:
+            partial[rel] = shown
 
     counts_note = ", ".join(f"{p}={n} lines" for p, n in line_counts.items())
     extra_parts: list[str] = []
@@ -189,6 +233,11 @@ def propose_edits(
         extra_parts.append(
             f"Line counts for current files: {counts_note}. "
             "Never use start_line/end_line beyond these counts."
+        )
+    if partial:
+        shown_note = ", ".join(f"{p} lines {a}-{b}" for p, (a, b) in partial.items())
+        extra_parts.append(
+            f"Only part of some files is shown: {shown_note}. Edit only lines that are shown."
         )
     if state.last_error:
         extra_parts.append(state.last_error)
@@ -233,6 +282,26 @@ def propose_edits(
         raise EditError("LLM returned non-list edits")
 
     hunks = _parse_hunks(raw_edits, root=root, step=step)
+
+    unseen = [h for h in hunks if h.path in partial and not _within(h, partial[h.path])]
+    if unseen:
+        h = unseen[0]
+        first, last = partial[h.path]
+        msg = (
+            f"{h.path}: lines {h.start_line}-{h.end_line} were not shown to you "
+            f"(only {first}-{last} were)."
+        )
+        if focus is None:
+            # Show the region the model asked about, then ask again once
+            return propose_edits(
+                state,
+                step,
+                client=client,
+                force=True,
+                bound_error=msg + " That part of the file is shown now; base the edit on it.",
+                focus={h.path: h.start_line},
+            )
+        raise EditError(msg)
 
     if not hunks and not force:
         return propose_edits(state, step, client=client, force=True)

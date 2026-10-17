@@ -1,23 +1,5 @@
-import json
-from types import SimpleNamespace
-
 from agent.loop import handle_consistency, handle_execute, handle_summarize, handle_verify
 from agent.state import AgentState, EditHunk, Phase, PlanStep
-
-
-class _FakeLLM:
-    """OpenAI-shaped client; `reply(prompt)` returns the JSON object to send back."""
-
-    def __init__(self, reply):
-        self.reply = reply
-        self.prompts: list[str] = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
-
-    def _create(self, **kwargs):
-        prompt = kwargs["messages"][-1]["content"]
-        self.prompts.append(prompt)
-        content = json.dumps(self.reply(prompt))
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
 
 def test_summarize_goes_to_done():
@@ -117,7 +99,7 @@ def test_verify_fail_retries_execute(tmp_path):
     assert f.read_text(encoding="utf-8") == "x = 1\n"
 
 
-def test_repair_round_keeps_finished_edits(tmp_path):
+def test_repair_round_keeps_finished_edits(tmp_path, fake_llm):
     (tmp_path / "c").mkdir()
     (tmp_path / "r").mkdir()
     ctrl = tmp_path / "c" / "ctrl.js"
@@ -140,14 +122,14 @@ def test_repair_round_keeps_finished_edits(tmp_path):
         return {"edits": [{"path": "c/ctrl.js", "start_line": 2, "end_line": 1,
                            "new_text": "exports.bar = () => {};\n"}]}
 
-    handle_execute(state, client=_FakeLLM(reply))
+    handle_execute(state, client=fake_llm(reply))
     assert state.phase == Phase.VERIFY
     assert state.plan[0].status == "done"
     assert routes.read_text(encoding="utf-8").endswith("notes.bar();\n")
     assert "exports.bar" in ctrl.read_text(encoding="utf-8")
 
 
-def test_failed_step_retry_keeps_earlier_steps(tmp_path):
+def test_failed_step_retry_keeps_earlier_steps(tmp_path, fake_llm):
     a = tmp_path / "a.py"
     a.write_text("x = 1\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("y = 1\n", encoding="utf-8")
@@ -164,7 +146,7 @@ def test_failed_step_retry_keeps_earlier_steps(tmp_path):
         # out-of-range lines: step 2 fails every time
         return {"edits": [{"path": "b.py", "start_line": 5, "end_line": 6, "new_text": "y = 2\n"}]}
 
-    handle_execute(state, client=_FakeLLM(reply))
+    handle_execute(state, client=fake_llm(reply))
     assert a.read_text(encoding="utf-8") == "x = 2\n"
     assert [s.status for s in state.plan] == ["done", "pending"]
     assert state.retry_count == 1
