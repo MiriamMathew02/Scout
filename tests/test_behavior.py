@@ -58,3 +58,28 @@ def test_route_prefix_inconsistency(tmp_path: Path):
     )
     assert not result.ok
     assert any("prefix" in m.lower() for m in result.messages)
+
+
+def _route_check(tmp_path: Path, old: str, new: str):
+    (tmp_path / "routes.js").write_text(new, encoding="utf-8")
+    return check_behavior(
+        tmp_path,
+        task="t",
+        touched=["routes.js"],
+        backups={"routes.js": old},
+        candidates=["routes.js"],
+        use_llm=False,
+    )
+
+
+def test_route_prefix_check_works_for_any_resource(tmp_path: Path):
+    old = "router.get('/tasks', tasks.list);\n"
+    result = _route_check(tmp_path, old, old + "router.get('/api/tasks/search', tasks.search);\n")
+    assert not result.ok
+    assert any("/api/tasks" in m for m in result.messages)
+
+
+def test_route_prefix_check_allows_existing_dual_prefixes(tmp_path: Path):
+    old = "app.get('/users', pages.users);\napp.get('/api/users', api.users);\n"
+    result = _route_check(tmp_path, old, old + "app.get('/users/:id', pages.user);\n")
+    assert result.ok, result.messages

@@ -43,7 +43,7 @@ Prefer modifying existing files over creating new ones when appropriate.
 Every step must be implementable by editing files only.
 If you add a model/schema field (e.g. tags), you MUST also plan updates to create/update
 (or equivalent writers) so the field is actually persisted — not only search/read paths.
-Match existing API route prefixes (do not invent /api/... if the app uses /notes).
+Match existing API route prefixes (do not add an /api/ prefix the existing routes don't use, or drop one they do).
 """
 )
 
@@ -71,15 +71,15 @@ Rules:
 - new_text must be the actual new source code (not a description of the change).
 - Match existing indentation and coding style.
 - NEVER re-declare identifiers that already exist in the file (e.g. do not add a second
-  `const mongoose = require(...)` or `const Note = require(...)` if one is already present).
+  `const express = require(...)` or `import os` if one is already present).
   When inserting new code mid-file, omit require/import lines that already exist at the top.
 - end_line must not exceed the file's last line number shown in the prompt.
 - Returning {"edits": []} is only allowed if the step is already fully implemented in the given files.
 - For implement steps (add fields, search, routes, etc.) you MUST return at least one edit.
 - Related files may be included for context: if you add a schema field, also update
   writers (create/update) in those related files in the same response when needed.
-- Prefer $and (or equivalent) when combining independent filters (text query AND tags),
-  unless the task explicitly wants OR.
+- When combining independent filters, require all of them (AND) unless the task
+  explicitly wants OR.
 - Keep new routes on the same path prefix as existing routes in the file.
 """
 )

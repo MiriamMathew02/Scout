@@ -77,3 +77,38 @@ def test_scope_includes_neighbors():
     assert "a.js" in scope
     assert "b.js" in scope
     assert "c.js" in scope
+
+
+def _py_check(root: Path, files: list[str], touched: str):
+    graph = build_dependency_graph(root, files)
+    return check_consistency(root, touched=[touched], graph=graph, use_llm=False)
+
+
+def test_python_check_passes_unedited_sample_app():
+    root = Path(__file__).resolve().parent.parent / "fixtures" / "mini_py"
+    files = ["calc/__init__.py", "calc/main.py", "calc/mathops.py"]
+    result = _py_check(root, files, "calc/main.py")
+    assert result.ok, result.as_text()
+
+
+def test_python_check_accepts_constants_and_submodules(tmp_path: Path):
+    pkg = tmp_path / "app"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("VERSION = '1'\n", encoding="utf-8")
+    (pkg / "config.py").write_text("DEBUG = True\n\n\ndef load():\n    pass\n", encoding="utf-8")
+    (pkg / "main.py").write_text(
+        "from app.config import DEBUG, load\nfrom app import config\n\nprint(DEBUG, load, config)\n",
+        encoding="utf-8",
+    )
+    result = _py_check(tmp_path, ["app/__init__.py", "app/config.py", "app/main.py"], "app/main.py")
+    assert result.ok, result.as_text()
+
+
+def test_python_check_flags_missing_name(tmp_path: Path):
+    pkg = tmp_path / "app"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "config.py").write_text("DEBUG = True\n", encoding="utf-8")
+    (pkg / "main.py").write_text("from app.config import DEBUG, MISSING\n", encoding="utf-8")
+    result = _py_check(tmp_path, ["app/__init__.py", "app/config.py", "app/main.py"], "app/main.py")
+    assert [i.symbol for i in result.issues] == ["MISSING"]

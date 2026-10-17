@@ -1,4 +1,4 @@
-"""Pre-apply guards: line bounds, duplicate JS declarations, obvious bad hunks."""
+"""Pre-apply guards: line bounds, duplicate top-level JS requires, obvious bad hunks."""
 
 from __future__ import annotations
 
@@ -8,20 +8,17 @@ from pathlib import Path
 from agent.execution.atomic_edit import EditError
 from agent.state import EditHunk
 
+# Top-level (unindented) declarations only: names inside functions may repeat freely.
 _DECL_RE = re.compile(
-    r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
+    r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
     re.MULTILINE,
 )
 _REQUIRE_RE = re.compile(
-    r"""^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(""",
+    r"""^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(""",
     re.MULTILINE,
 )
 _FUNC_RE = re.compile(
-    r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
-    re.MULTILINE,
-)
-_EXPORTS_FN_RE = re.compile(
-    r"^\s*exports\.([A-Za-z_$][\w$]*)\s*=",
+    r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
     re.MULTILINE,
 )
 
@@ -106,8 +103,9 @@ def _strip_duplicate_js_decls(
     new_text: str,
 ) -> str:
     """
-    Remove lines from new_text that redeclare identifiers already present
-    outside the replaced region (prevents 'Identifier X has already been declared').
+    Remove top-level require lines from new_text that re-require a name already
+    declared at top level outside the replaced region (prevents 'Identifier X has
+    already been declared'). Other duplicates are left for `node --check` to report.
     """
     if end < start:
         kept_outside = lines[: start - 1] + lines[start - 1 :]
@@ -139,16 +137,14 @@ def _strip_duplicate_js_decls(
 
 def _declared_names(text: str) -> set[str]:
     names: set[str] = set()
-    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE, _EXPORTS_FN_RE):
+    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE):
         for m in rx.finditer(text):
             names.add(m.group(1))
     return names
 
 
 def _names_declared_on_line(line: str) -> set[str]:
-    names: set[str] = set()
-    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE):
-        m = rx.match(line)
-        if m:
-            names.add(m.group(1))
-    return names
+    # Only re-added requires are stripped. Any other duplicate fails `node --check`,
+    # which rolls the step back and retries with the error message.
+    m = _REQUIRE_RE.match(line)
+    return {m.group(1)} if m else set()

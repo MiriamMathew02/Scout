@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from agent.discovery.symbols import (
+    _schema_fields_in_text,
     build_symbol_graph,
     check_schema_field_plumbing,
     detect_added_schema_fields,
@@ -88,3 +89,19 @@ def test_field_plumbing_ok_when_create_sets_tags(tmp_path: Path):
     g = build_symbol_graph(tmp_path, ["model.js", "ctrl.js"])
     issues = check_schema_field_plumbing(g, added_fields=["tags"])
     assert issues == []
+
+
+def test_schema_fields_after_a_nested_object():
+    text = "new Schema({ title: { type: String, required: true }, tags: [String], body: String })"
+    assert _schema_fields_in_text(text) == ["title", "tags", "body"]
+
+
+def test_schema_option_keys_and_comments_are_not_fields():
+    text = (
+        "mongoose.Schema({\n"
+        "  // when it was posted\n"
+        "  postedAt: { type: Date, default: Date.now },\n"
+        "  'author': String\n"
+        "}, { timestamps: true })"
+    )
+    assert _schema_fields_in_text(text) == ["postedAt", "author"]

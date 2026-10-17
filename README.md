@@ -56,7 +56,7 @@ Exit code `0` = success (`DONE`), `1` = failure (`FAILED`).
 | Execute | Apply the edits line-by-line |
 | Verify | Check that each file (that has been edited) is readable and syntactically correct |
 | Consistency | Check that the neighbour files still call each other by the right name |
-| Behavior | Check that the feature is not half-done |
+| Behavior | Check that the feature is not half-done (schema-field plumbing currently understands Mongoose schemas and Express handlers) |
 | Summarize | Write a short report of what was done |
 
 

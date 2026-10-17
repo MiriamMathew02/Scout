@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from agent.discovery.scan import clean_rel_path
 from agent.discovery.snippets import excerpt_for_prompt
 from agent.llm import chat_json
 from agent.prompts import EXPLORE_SYSTEM, explore_user_prompt
@@ -71,7 +72,7 @@ def explore_with_llm(
     for item in ranked:
         if not isinstance(item, str):
             continue
-        path = item.replace("\\", "/").lstrip("./")
+        path = clean_rel_path(item)
         if path in candidate_set or (root / path).is_file():
             if path not in valid:
                 valid.append(path)
