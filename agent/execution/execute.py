@@ -301,12 +301,17 @@ def run_plan_step(
         else:
             pre_step[rel] = ""
 
-    summaries = apply_edits(
-        root,
-        hunks,
-        dry_run=state.dry_run,
-        backups=state.backups,
-    )
+    try:
+        summaries = apply_edits(
+            root,
+            hunks,
+            dry_run=state.dry_run,
+            backups=state.backups,
+        )
+    except EditError:
+        if not state.dry_run:
+            rollback_edits(root, pre_step)  # leave no half-applied step behind
+        raise
     state.applied_edits.extend(hunks)
 
     if not state.dry_run:
