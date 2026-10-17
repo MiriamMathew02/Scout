@@ -7,6 +7,7 @@ routes calling notes.search while the controller exports searchNotes.
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -297,15 +298,18 @@ def _check_python_imports(root: Path, scope: list[str]) -> list[ConsistencyIssue
     if len(py_files) < 2:
         return issues
 
-    def_names: dict[str, set[str]] = {}
+    def_names: dict[str, set[str] | None] = {}
+    trees: dict[str, ast.Module] = {}
     for rel in py_files:
         path = root / rel
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        names = set(re.findall(r"^\s*def\s+(\w+)", text, re.MULTILINE))
-        names |= set(re.findall(r"^\s*class\s+(\w+)", text, re.MULTILINE))
-        def_names[rel] = names
+        try:
+            trees[rel] = ast.parse(text)
+        except SyntaxError:
+            continue  # reported by the verify phase
+        def_names[rel] = _python_top_level_names(trees[rel])
 
     typing_skip = {
         "Optional",
@@ -322,30 +326,28 @@ def _check_python_imports(root: Path, scope: list[str]) -> list[ConsistencyIssue
         "TYPE_CHECKING",
     }
 
-    for rel in py_files:
-        path = root / rel
-        if not path.is_file():
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for m in re.finditer(
-            r"^\s*from\s+(\.?[\w.]*)\s+import\s+([A-Za-z0-9_,\s*]+)",
-            text,
-            re.MULTILINE,
-        ):
-            mod, imports = m.group(1), m.group(2)
-            if "*" in imports or not mod or mod.startswith("."):
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
                 # skip relative imports (harder to resolve reliably)
                 continue
+            mod = node.module
             target = _resolve_py_module(mod, set(def_names), root)
             if not target or target not in def_names:
                 continue
             defined = def_names[target]
             if not defined:
                 continue
-            for name in [x.strip() for x in imports.split(",")]:
-                name = name.split(" as ")[0].strip()
-                if not name or name in typing_skip or name.startswith("_"):
+            package_dir = (root / target).parent if target.endswith("__init__.py") else None
+            for alias in node.names:
+                name = alias.name
+                if name == "*" or name in typing_skip or name.startswith("_"):
                     continue
+                if package_dir and (
+                    (package_dir / f"{name}.py").is_file()
+                    or (package_dir / name / "__init__.py").is_file()
+                ):
+                    continue  # `from pkg import submodule`
                 if name not in defined:
                     issues.append(
                         ConsistencyIssue(
@@ -361,6 +363,35 @@ def _check_python_imports(root: Path, scope: list[str]) -> list[ConsistencyIssue
                         )
                     )
     return issues
+
+
+def _python_top_level_names(tree: ast.Module) -> set[str] | None:
+    """Names a module binds at top level, or None when that can't be known statically."""
+    names: set[str] = set()
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    return None
+                names.add((alias.asname or alias.name).split(".")[0])
+        else:
+            # module-level if / try / with blocks can bind names too
+            pending.extend(
+                child
+                for child in ast.iter_child_nodes(node)
+                if isinstance(child, (ast.stmt, ast.excepthandler))
+            )
+    if "__getattr__" in names:
+        return None
+    return names
 
 
 def _resolve_py_module(
