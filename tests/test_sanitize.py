@@ -65,9 +65,24 @@ def test_keeps_local_variable_in_new_function(tmp_path: Path):
     assert cleaned[0].new_text == new_fn
 
 
-def test_leaves_other_duplicates_for_syntax_check(tmp_path: Path):
+def test_rejects_second_top_level_const(tmp_path: Path):
     f = tmp_path / "a.js"
     f.write_text("const PORT = 3000;\n", encoding="utf-8")
     hunk = EditHunk(path="a.js", start_line=2, end_line=1, new_text="const PORT = 4000;\n")
+    with pytest.raises(EditError, match="'PORT' a second time"):
+        validate_and_sanitize_hunks(tmp_path, [hunk])
+
+
+def test_rejects_duplicate_declaration_in_typescript(tmp_path: Path):
+    # TypeScript gets no syntax check, so the sanitizer must catch this one
+    (tmp_path / "app.ts").write_text("const value: number = 1;\n", encoding="utf-8")
+    hunk = EditHunk(path="app.ts", start_line=2, end_line=1, new_text="export const value = 2;\n")
+    with pytest.raises(EditError, match="'value' a second time"):
+        validate_and_sanitize_hunks(tmp_path, [hunk])
+
+
+def test_allows_replacing_the_declaration_itself(tmp_path: Path):
+    (tmp_path / "app.ts").write_text("const value: number = 1;\nexport class Box {}\n", encoding="utf-8")
+    hunk = EditHunk(path="app.ts", start_line=1, end_line=1, new_text="const value: number = 2;\n")
     cleaned = validate_and_sanitize_hunks(tmp_path, [hunk])
-    assert cleaned[0].new_text == "const PORT = 4000;\n"
+    assert cleaned[0].new_text == "const value: number = 2;\n"

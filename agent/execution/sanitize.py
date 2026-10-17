@@ -10,8 +10,9 @@ from agent.execution.atomic_edit import EditError
 from agent.state import EditHunk
 
 # Top-level (unindented) declarations only: names inside functions may repeat freely.
+_EXPORT = r"(?:export\s+(?:default\s+)?)?"
 _DECL_RE = re.compile(
-    r"^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
+    rf"^{_EXPORT}(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[=:]",
     re.MULTILINE,
 )
 _REQUIRE_RE = re.compile(
@@ -19,8 +20,16 @@ _REQUIRE_RE = re.compile(
     re.MULTILINE,
 )
 _FUNC_RE = re.compile(
-    r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
+    rf"^{_EXPORT}(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*[(<]",
     re.MULTILINE,
+)
+_CLASS_RE = re.compile(
+    rf"^{_EXPORT}class\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+# const / let / class may be declared only once per scope, in JS and TypeScript alike
+_LEXICAL_RE = re.compile(
+    rf"^{_EXPORT}(?:(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[=:]|class\s+([A-Za-z_$][\w$]*))"
 )
 
 
@@ -72,7 +81,7 @@ def validate_and_sanitize_hunks(
 
         new_text = h.new_text
         if path.suffix.lower() in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
-            new_text = _strip_duplicate_js_decls(text, lines, start, end, new_text)
+            new_text = _strip_duplicate_js_decls(h.path, text, lines, start, end, new_text)
 
         cleaned.append(
             EditHunk(
@@ -99,6 +108,7 @@ def validate_and_sanitize_hunks(
 
 
 def _strip_duplicate_js_decls(
+    path: str,
     full_text: str,
     lines: list[str],
     start: int,
@@ -106,9 +116,11 @@ def _strip_duplicate_js_decls(
     new_text: str,
 ) -> str:
     """
-    Remove top-level require lines from new_text that re-require a name already
-    declared at top level outside the replaced region (prevents 'Identifier X has
-    already been declared'). Other duplicates are left for `node --check` to report.
+    Handle new top-level declarations of names already declared at top level
+    outside the replaced region ('Identifier X has already been declared'):
+    re-added require lines are dropped, and a second const / let / class raises
+    EditError so the model edits the existing one. TypeScript gets no syntax check
+    later, so this has to catch it here. Indented (local) names are left alone.
     """
     if end < start:
         kept_outside = lines[: start - 1] + lines[start - 1 :]
@@ -127,6 +139,12 @@ def _strip_duplicate_js_decls(
         if names and any(n in existing for n in names):
             # skip re-declaration
             continue
+        clash = _lexical_name(bare)
+        if clash and clash in existing:
+            raise EditError(
+                f"{path}: new code declares top-level '{clash}' a second time. "
+                "Change the existing declaration instead of adding another."
+            )
         out_lines.append(line if line.endswith("\n") else line + "\n")
 
     # If we stripped everything but original had content, keep original new_text
@@ -140,14 +158,18 @@ def _strip_duplicate_js_decls(
 
 def _declared_names(text: str) -> set[str]:
     names: set[str] = set()
-    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE):
+    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE, _CLASS_RE):
         for m in rx.finditer(text):
             names.add(m.group(1))
     return names
 
 
 def _names_declared_on_line(line: str) -> set[str]:
-    # Only re-added requires are stripped. Any other duplicate fails `node --check`,
-    # which rolls the step back and retries with the error message.
+    # Only re-added requires are stripped; see _lexical_name for other duplicates.
     m = _REQUIRE_RE.match(line)
     return {m.group(1)} if m else set()
+
+
+def _lexical_name(line: str) -> str | None:
+    m = _LEXICAL_RE.match(line)
+    return (m.group(1) or m.group(2)) if m else None
