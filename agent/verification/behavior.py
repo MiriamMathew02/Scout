@@ -142,9 +142,11 @@ def _check_route_prefix_consistency(
     """Flag routes added in this run on '/x' when other routes use '/api/x', or the reverse.
 
     Only new routes are judged, so an app that already serves both prefixes on purpose
-    (pages on /users, JSON on /api/users) is left alone.
+    (pages on /users, JSON on /api/users) is left alone. The conflict must still exist
+    in the current files: moving every /notes route to /api/notes is not a conflict.
     """
     old_buckets: set[str] = set()
+    current_buckets: set[str] = set()
     new_paths: list[str] = []
     scan = list(dict.fromkeys(touched + [c for c in candidates if "route" in c.lower()]))
     for rel in scan:
@@ -157,13 +159,13 @@ def _check_route_prefix_consistency(
             continue
         before = _route_paths(backups.get(rel) or "") if rel in touched else current
         old_buckets |= {_prefix_bucket(p) for p in before}
+        current_buckets |= {_prefix_bucket(p) for p in current}
         new_paths += [p for p in current if p not in before]
 
-    all_buckets = old_buckets | {_prefix_bucket(p) for p in new_paths}
     for p in new_paths:
         bucket = _prefix_bucket(p)
         twin = bucket[len("/api"):] if bucket.startswith("/api/") else "/api" + bucket
-        if twin in all_buckets and bucket not in old_buckets:
+        if twin in current_buckets and bucket not in old_buckets:
             return (
                 f"Route prefix inconsistency: new route '{p}' uses '{bucket}', but other "
                 f"routes use '{twin}'. Prefer one API prefix matching existing routes."

@@ -83,3 +83,10 @@ def test_route_prefix_check_allows_existing_dual_prefixes(tmp_path: Path):
     old = "app.get('/users', pages.users);\napp.get('/api/users', api.users);\n"
     result = _route_check(tmp_path, old, old + "app.get('/users/:id', pages.user);\n")
     assert result.ok, result.messages
+
+
+def test_route_prefix_check_allows_moving_every_route(tmp_path: Path):
+    old = "app.get('/notes', notes.list);\napp.post('/notes', notes.create);\n"
+    new = "app.get('/api/notes', notes.list);\napp.post('/api/notes', notes.create);\n"
+    result = _route_check(tmp_path, old, new)
+    assert result.ok, result.messages
