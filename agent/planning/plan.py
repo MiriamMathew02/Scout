@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.discovery.graph import topological_edit_order
+from agent.discovery.scan import clean_rel_path, resolve_inside
 from agent.llm import chat_json
 from agent.prompts import PLAN_SYSTEM, plan_user_prompt
 from agent.state import AgentState, PlanStep
@@ -45,7 +46,7 @@ def create_plan(state: AgentState, *, client: Any = None) -> list[PlanStep]:
         files = item.get("files") or []
         if isinstance(files, str):
             files = [files]
-        files = [str(f).replace("\\", "/").lstrip("./") for f in files]
+        files = [clean_rel_path(str(f)) for f in files]
         action = str(item.get("action", "modify")).lower()
         if action not in {"modify", "create", "delete"}:
             action = "modify"
@@ -78,17 +79,37 @@ def create_plan(state: AgentState, *, client: Any = None) -> list[PlanStep]:
     return steps
 
 
-_OPS_KEYWORDS = (
-    "restart",
+# Phrases that mean "run an operation" rather than "edit a file". Kept specific on
+# purpose: a bare "docker" or "deploy" also matches real edits like "Update the Dockerfile".
+_OPS_PHRASES = (
+    "restart the server",
+    "restart the app",
+    "restart the service",
     "reboot",
     "install dependenc",
+    "install package",
     "npm install",
     "yarn install",
+    "pnpm install",
     "pip install",
     "run the server",
     "start the server",
-    "deploy",
+    "run docker",
+    "docker compose up",
+    "docker-compose up",
+    "deploy to production",
+    "deploy the app",
+    "redeploy",
+    "manual step",
+    "manually test",
+    "manual testing",
 )
+
+
+def is_ops_step(description: str) -> bool:
+    """True when a step asks for an operation (install, restart, deploy), not an edit."""
+    text = description.lower()
+    return any(p in text for p in _OPS_PHRASES)
 
 
 def validate_plan(state: AgentState, steps: list[PlanStep]) -> list[PlanStep]:
@@ -98,9 +119,9 @@ def validate_plan(state: AgentState, steps: list[PlanStep]) -> list[PlanStep]:
     for step in steps[:10]:
         if not step.description.strip():
             continue
-        desc_l = step.description.lower()
-        if any(k in desc_l for k in _OPS_KEYWORDS):
+        if is_ops_step(step.description):
             continue
+        step.files = [f for f in step.files if resolve_inside(root, f) is not None]
         if not step.files and step.action != "create":
             continue
         if step.action == "modify":

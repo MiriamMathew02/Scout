@@ -7,12 +7,13 @@ routes calling notes.search while the controller exports searchNotes.
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.discovery.graph import neighbors
+from agent.discovery.graph import build_dependency_graph, neighbors
 from agent.discovery.snippets import read_line_numbered
 from agent.llm import chat_json
 
@@ -57,15 +58,17 @@ class ConsistencyResult:
     ok: bool
     issues: list[ConsistencyIssue] = field(default_factory=list)
     scope_files: list[str] = field(default_factory=list)
+    review_error: str | None = None  # set when the LLM review was asked for but did not complete
 
     def as_text(self) -> str:
+        note = f"\nLLM consistency review did not complete: {self.review_error}" if self.review_error else ""
         if self.ok:
             scope = ", ".join(self.scope_files[:12]) or "(none)"
-            return f"PASS\nConsistency OK over: {scope}"
+            return f"PASS\nConsistency OK over: {scope}{note}"
         lines = ["FAIL", f"Checked files: {', '.join(self.scope_files)}"]
         for issue in self.issues:
             lines.append(issue.as_text())
-        return "\n".join(lines)
+        return "\n".join(lines) + note
 
 
 def files_in_consistency_scope(
@@ -90,10 +93,12 @@ def check_consistency(
     model: str | None = None,
     task: str = "",
     client: Any = None,
+    deleted: list[str] | None = None,
 ) -> ConsistencyResult:
     """
     Static checks first (JS require/export wiring); optional LLM review
-    of the same file scope for residual mistakes.
+    of the same file scope for residual mistakes. `deleted` lists files this
+    run removed; any file that still imports one of them is an issue.
     """
     root = Path(repo_root).resolve()
     scope = files_in_consistency_scope(touched, graph, hops=hops)
@@ -105,6 +110,9 @@ def check_consistency(
     issues: list[ConsistencyIssue] = []
     issues.extend(_check_js_require_exports(root, scope))
     issues.extend(_check_python_imports(root, scope))
+    if deleted:
+        files = list(dict.fromkeys(list(graph.keys()) + scope))
+        issues.extend(check_deleted_references(root, deleted, files))
 
     if use_llm and not issues:
         # Only spend tokens if static checks are clean but we still want a pass
@@ -115,8 +123,9 @@ def check_consistency(
         # in unusual patterns; skip LLM if static already failed (enough signal to re-execute).
         pass
 
+    review_error = None
     if use_llm and not issues and scope:
-        llm_issues = _llm_consistency_review(
+        llm_issues, review_error = _llm_consistency_review(
             root,
             scope,
             touched=touched,
@@ -129,7 +138,9 @@ def check_consistency(
         # Static already failed — skip LLM, return static issues for repair
         pass
 
-    return ConsistencyResult(ok=len(issues) == 0, issues=issues, scope_files=scope)
+    return ConsistencyResult(
+        ok=len(issues) == 0, issues=issues, scope_files=scope, review_error=review_error
+    )
 
 
 def _check_js_require_exports(root: Path, scope: list[str]) -> list[ConsistencyIssue]:
@@ -215,6 +226,33 @@ def _check_js_require_exports(root: Path, scope: list[str]) -> list[ConsistencyI
     return issues
 
 
+def check_deleted_references(
+    root: Path, deleted: list[str], files: list[str]
+) -> list[ConsistencyIssue]:
+    """Files that still import a module this run deleted."""
+    gone = set(deleted)
+    # Import edges only: a test file sitting next to a deleted module is not a reference
+    graph = build_dependency_graph(root, list(dict.fromkeys(files + deleted)), structural=False)
+    issues: list[ConsistencyIssue] = []
+    for src, deps in graph.items():
+        if src in gone or not (root / src).is_file():
+            continue
+        for dep in deps:
+            if dep in gone:
+                issues.append(
+                    ConsistencyIssue(
+                        kind="deleted_module_in_use",
+                        message=(
+                            f"'{src}' still imports '{dep}', which this run deleted. "
+                            f"Update '{src}' or keep '{dep}'."
+                        ),
+                        file=src,
+                        related_file=dep,
+                    )
+                )
+    return issues
+
+
 def _extract_js_exports(text: str) -> set[str]:
     names: set[str] = set()
     for m in _EXPORTS_RE.finditer(text):
@@ -297,15 +335,18 @@ def _check_python_imports(root: Path, scope: list[str]) -> list[ConsistencyIssue
     if len(py_files) < 2:
         return issues
 
-    def_names: dict[str, set[str]] = {}
+    def_names: dict[str, set[str] | None] = {}
+    trees: dict[str, ast.Module] = {}
     for rel in py_files:
         path = root / rel
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        names = set(re.findall(r"^\s*def\s+(\w+)", text, re.MULTILINE))
-        names |= set(re.findall(r"^\s*class\s+(\w+)", text, re.MULTILINE))
-        def_names[rel] = names
+        try:
+            trees[rel] = ast.parse(text)
+        except SyntaxError:
+            continue  # reported by the verify phase
+        def_names[rel] = _python_top_level_names(trees[rel])
 
     typing_skip = {
         "Optional",
@@ -322,30 +363,28 @@ def _check_python_imports(root: Path, scope: list[str]) -> list[ConsistencyIssue
         "TYPE_CHECKING",
     }
 
-    for rel in py_files:
-        path = root / rel
-        if not path.is_file():
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for m in re.finditer(
-            r"^\s*from\s+(\.?[\w.]*)\s+import\s+([A-Za-z0-9_,\s*]+)",
-            text,
-            re.MULTILINE,
-        ):
-            mod, imports = m.group(1), m.group(2)
-            if "*" in imports or not mod or mod.startswith("."):
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
                 # skip relative imports (harder to resolve reliably)
                 continue
+            mod = node.module
             target = _resolve_py_module(mod, set(def_names), root)
             if not target or target not in def_names:
                 continue
             defined = def_names[target]
             if not defined:
                 continue
-            for name in [x.strip() for x in imports.split(",")]:
-                name = name.split(" as ")[0].strip()
-                if not name or name in typing_skip or name.startswith("_"):
+            package_dir = (root / target).parent if target.endswith("__init__.py") else None
+            for alias in node.names:
+                name = alias.name
+                if name == "*" or name in typing_skip or name.startswith("_"):
                     continue
+                if package_dir and (
+                    (package_dir / f"{name}.py").is_file()
+                    or (package_dir / name / "__init__.py").is_file()
+                ):
+                    continue  # `from pkg import submodule`
                 if name not in defined:
                     issues.append(
                         ConsistencyIssue(
@@ -361,6 +400,35 @@ def _check_python_imports(root: Path, scope: list[str]) -> list[ConsistencyIssue
                         )
                     )
     return issues
+
+
+def _python_top_level_names(tree: ast.Module) -> set[str] | None:
+    """Names a module binds at top level, or None when that can't be known statically."""
+    names: set[str] = set()
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == "*":
+                    return None
+                names.add((alias.asname or alias.name).split(".")[0])
+        else:
+            # module-level if / try / with blocks can bind names too
+            pending.extend(
+                child
+                for child in ast.iter_child_nodes(node)
+                if isinstance(child, (ast.stmt, ast.excepthandler))
+            )
+    if "__getattr__" in names:
+        return None
+    return names
 
 
 def _resolve_py_module(
@@ -407,7 +475,8 @@ def _llm_consistency_review(
     task: str,
     model: str | None,
     client: Any,
-) -> list[ConsistencyIssue]:
+) -> tuple[list[ConsistencyIssue], str | None]:
+    """Return (issues, error); error says why the review did not complete."""
     # Cap files for tokens
     files_to_show = list(dict.fromkeys(touched + scope))[:10]
     parts: list[str] = []
@@ -426,7 +495,7 @@ def _llm_consistency_review(
         parts.append(f"===== {rel} =====\n{body}")
 
     if not parts:
-        return []
+        return [], None
 
     user = (
         f"Task that was implemented:\n{task}\n\n"
@@ -445,12 +514,12 @@ def _llm_consistency_review(
             client=client,
             max_tokens=2000,
         )
-    except Exception:  # noqa: BLE001 — soft: static checks already ran
-        return []
+    except Exception as exc:  # noqa: BLE001 — soft: static checks already ran
+        return [], f"model request failed: {exc}"
 
-    raw = data.get("issues") or []
+    raw = data.get("issues")
     if not isinstance(raw, list):
-        return []
+        return [], "reply had no 'issues' list"
     out: list[ConsistencyIssue] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -467,4 +536,4 @@ def _llm_consistency_review(
                 symbol=str(item.get("symbol") or ""),
             )
         )
-    return out
+    return out, None

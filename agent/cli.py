@@ -90,6 +90,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         run_agent(state)
+    except KeyboardInterrupt:
+        print("\nStopped. Any edits made so far were rolled back.", file=sys.stderr)
+        return 130
     except RuntimeError as exc:
         print(f"Fatal: {exc}", file=sys.stderr)
         return 2

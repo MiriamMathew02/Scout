@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent.discovery.scan import resolve_inside
 from agent.state import EditHunk
 
 
@@ -16,7 +17,7 @@ def apply_hunk(
     hunk: EditHunk,
     *,
     dry_run: bool = False,
-    backups: dict[str, str] | None = None,
+    backups: dict[str, str | None] | None = None,
     allow_create: bool = True,
 ) -> str:
     """
@@ -40,18 +41,20 @@ def apply_hunk(
         original = ""
         lines: list[str] = []
     else:
-        original = path.read_text(encoding="utf-8", errors="replace")
+        # Bytes, not read_text: no newline translation, so untouched lines stay exact
+        try:
+            original = path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise EditError(f"{rel}: not valid UTF-8; refusing to rewrite it") from exc
         lines = original.splitlines(keepends=True)
 
     if backups is not None and rel not in backups:
-        backups[rel] = original
+        # None marks a file that did not exist yet; "" is an existing empty file
+        backups[rel] = original if path.exists() else None
 
     # Normalize line endings in new_text to match file (default \n)
-    new_block = hunk.new_text
-    if new_block and not new_block.endswith("\n") and "\n" in new_block:
-        # keep as-is for partial mid-line replacements; splitlines handles content
-        pass
-    new_lines = _to_lines(new_block)
+    eol = "\r\n" if "\r\n" in original else "\n"
+    new_lines = [line.rstrip("\r\n") + eol for line in _to_lines(hunk.new_text)]
 
     n = len(lines)
     start = hunk.start_line
@@ -79,13 +82,13 @@ def apply_hunk(
     new_content = "".join(result_lines)
     # Ensure trailing newline for non-empty text files (common convention)
     if new_content and not new_content.endswith("\n"):
-        new_content += "\n"
+        new_content += eol
 
     summary = _diff_summary(rel, start, end, hunk.new_text)
 
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(new_content, encoding="utf-8")
+        path.write_bytes(new_content.encode("utf-8"))
 
     return summary
 
@@ -95,12 +98,14 @@ def apply_edits(
     hunks: list[EditHunk],
     *,
     dry_run: bool = False,
-    backups: dict[str, str] | None = None,
+    backups: dict[str, str | None] | None = None,
 ) -> list[str]:
     """
     Apply multiple hunks. Within each file, apply bottom-to-top so line
     numbers stay valid relative to the original content for that batch.
+    Overlapping hunks are rejected before anything is written.
     """
+    check_overlaps(hunks)
     # Group by path preserving reverse line order
     by_path: dict[str, list[EditHunk]] = {}
     for h in hunks:
@@ -108,7 +113,9 @@ def apply_edits(
 
     summaries: list[str] = []
     for path, group in by_path.items():
-        ordered = sorted(group, key=lambda h: (h.start_line, h.end_line), reverse=True)
+        ordered = sorted(
+            _merge_inserts(group), key=lambda h: (h.start_line, h.end_line), reverse=True
+        )
         for h in ordered:
             normalized = EditHunk(
                 path=path,
@@ -128,33 +135,83 @@ def apply_edits(
     return summaries
 
 
-def rollback_edits(repo_root: Path | str, backups: dict[str, str]) -> list[str]:
-    """Restore files from in-memory backups. Empty string means delete created file."""
+def check_overlaps(hunks: list[EditHunk]) -> None:
+    """Raise EditError when two hunks in one file would change the same lines."""
+    by_path: dict[str, list[EditHunk]] = {}
+    for h in hunks:
+        by_path.setdefault(h.path.replace("\\", "/"), []).append(h)
+    for path, group in by_path.items():
+        replaces = sorted(
+            (h for h in group if h.end_line >= h.start_line), key=lambda h: h.start_line
+        )
+        for a, b in zip(replaces, replaces[1:]):
+            if b.start_line <= a.end_line:
+                raise EditError(
+                    f"{path}: edits to lines {a.start_line}-{a.end_line} and "
+                    f"{b.start_line}-{b.end_line} overlap; combine them into one edit"
+                )
+        for ins in (h for h in group if h.end_line < h.start_line):
+            for r in replaces:
+                if r.start_line < ins.start_line <= r.end_line:
+                    raise EditError(
+                        f"{path}: an insert before line {ins.start_line} falls inside the "
+                        f"edit to lines {r.start_line}-{r.end_line}; combine them into one edit"
+                    )
+
+
+def _merge_inserts(group: list[EditHunk]) -> list[EditHunk]:
+    """Join inserts at the same line into one hunk, in the order they were given.
+
+    Applied one by one, each would land above the previous one and reverse their order.
+    """
+    out: list[EditHunk] = []
+    at_line: dict[int, int] = {}
+    for h in group:
+        if h.end_line < h.start_line and h.start_line in at_line:
+            i = at_line[h.start_line]
+            prev = out[i]
+            first = prev.new_text if not prev.new_text or prev.new_text.endswith("\n") else prev.new_text + "\n"
+            out[i] = EditHunk(
+                path=prev.path,
+                start_line=prev.start_line,
+                end_line=prev.end_line,
+                new_text=first + h.new_text,
+                rationale=prev.rationale,
+            )
+            continue
+        if h.end_line < h.start_line:
+            at_line[h.start_line] = len(out)
+        out.append(h)
+    return out
+
+
+def rollback_edits(repo_root: Path | str, backups: dict[str, str | None]) -> list[str]:
+    """Restore files from in-memory backups. None means the file was created, so delete it."""
     root = Path(repo_root).resolve()
     restored: list[str] = []
     for rel, content in backups.items():
         path = _safe_path(root, rel)
-        if content == "":
+        if content is None:
             if path.exists():
                 path.unlink()
                 # clean empty parents optionally — skip for safety
                 restored.append(f"deleted created file {rel}")
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            path.write_bytes(content.encode("utf-8", errors="surrogateescape"))
             restored.append(f"restored {rel}")
     return restored
 
 
+def read_exact(path: Path) -> str:
+    """File text with its line endings and any non-UTF-8 bytes kept, for exact restores."""
+    return path.read_bytes().decode("utf-8", errors="surrogateescape")
+
+
 def _safe_path(root: Path, rel: str) -> Path:
-    rel_norm = rel.replace("\\", "/").lstrip("/")
-    if rel_norm.startswith("..") or "/../" in f"/{rel_norm}/":
+    full = resolve_inside(root, rel.replace("\\", "/").lstrip("/"))
+    if full is None:
         raise EditError(f"Path escapes repository: {rel}")
-    full = (root / rel_norm).resolve()
-    try:
-        full.relative_to(root)
-    except ValueError as exc:
-        raise EditError(f"Path escapes repository: {rel}") from exc
     return full
 
 

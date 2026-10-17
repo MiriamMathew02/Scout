@@ -14,7 +14,7 @@ from agent.discovery.symbols import build_symbol_graph
 from agent.execution.atomic_edit import EditError, rollback_edits
 from agent.execution.execute import run_plan_step
 from agent.planning.plan import create_plan
-from agent.state import AgentState, Phase
+from agent.state import AgentState, Phase, PlanStep
 from agent.summary.summarize import build_summary
 from agent.verification.behavior import check_behavior
 from agent.verification.consistency import check_consistency
@@ -34,10 +34,35 @@ def _safe_rollback(state: AgentState) -> None:
             state.note(f"rollback warning: {exc}")
     state.backups.clear()
     state.applied_edits.clear()
+    # repair steps only make sense on top of the edits that were just undone
+    state.plan = [s for s in state.plan if not s.id.startswith("repair")]
+
+
+def _queue_repair_step(state: AgentState, files: list[str], check: str) -> None:
+    """Add one step that fixes what a check reported; finished steps keep their edits."""
+    root = Path(state.repo_path)
+    state.plan.append(
+        PlanStep(
+            id=f"repair-{state.retry_count}",
+            description=f"Fix the problems reported by the {check} check",
+            files=[f for f in dict.fromkeys(files) if f and (root / f).is_file()],
+            action="modify",
+        )
+    )
 
 
 def run_agent(state: AgentState, *, client: Any = None) -> AgentState:
     """Run discover → plan → execute → verify → consistency → behavior → summarize."""
+    try:
+        return _run_phases(state, client=client)
+    except BaseException:
+        # Ctrl+C (KeyboardInterrupt is not an Exception) or a crash outside the
+        # phase handlers: backups live only in memory, so restore files now
+        _safe_rollback(state)
+        raise
+
+
+def _run_phases(state: AgentState, *, client: Any = None) -> AgentState:
     handlers: dict[Phase, Handler] = {
         Phase.DISCOVER: lambda s: handle_discover(s, client=client),
         Phase.PLAN: lambda s: handle_plan(s, client=client),
@@ -204,16 +229,14 @@ def handle_execute(state: AgentState, *, client: Any = None) -> None:
                 break
         if state.retry_count < state.max_execute_retries:
             state.retry_count += 1
-            # Step-local retry: rollback only if we have no successful prior edits
-            # Full rollback is safer for syntax disasters mid-feature
-            _safe_rollback(state)
             if state.failed_step_id:
+                # Step-local retry: run_plan_step leaves nothing behind from the failed
+                # step, so finished steps keep their edits and only the failed step reruns
                 for step in state.plan:
-                    if step.id == state.failed_step_id:
-                        step.status = "pending"
-                    elif step.status == "failed":
+                    if step.status == "failed":
                         step.status = "pending"
             else:
+                _safe_rollback(state)
                 for step in state.plan:
                     if step.status != "skipped":
                         step.status = "pending"
@@ -290,6 +313,7 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
     state.note("consistency check (changed files + graph neighbors)")
     touched = list(dict.fromkeys(h.path for h in state.applied_edits))
     root = Path(state.repo_path)
+    deleted = [t for t in touched if state.backups.get(t) is not None and not (root / t).exists()]
 
     scope_seeds = list(dict.fromkeys(touched + state.relevant_files))[:250]
     if scope_seeds:
@@ -317,8 +341,11 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
         model=state.model,
         task=state.task,
         client=client,
+        deleted=deleted,
     )
     state.consistency_result = result.as_text()
+    if result.review_error:
+        state.review_errors.append(f"consistency: {result.review_error}")
     state.note(
         "consistency PASS"
         if result.ok
@@ -337,9 +364,8 @@ def handle_consistency(state: AgentState, *, client: Any = None) -> None:
     )
     if state.retry_count < state.max_execute_retries:
         state.retry_count += 1
-        for step in state.plan:
-            if step.status != "skipped":
-                step.status = "pending"
+        issue_files = [f for i in result.issues for f in (i.file, i.related_file)]
+        _queue_repair_step(state, issue_files + touched, "consistency")
         state.note(
             f"consistency failed; retry execute with fix context "
             f"({state.retry_count}/{state.max_execute_retries})"
@@ -376,6 +402,8 @@ def handle_behavior(state: AgentState, *, client: Any = None) -> None:
         symbol_graph=state.symbol_graph,  # type: ignore[arg-type]
     )
     state.behavior_result = result.as_text()
+    if result.review_error:
+        state.review_errors.append(f"behavior: {result.review_error}")
     state.note("behavior PASS" if result.ok else "behavior FAIL")
     for line in result.messages[:10]:
         state.note(line)
@@ -390,9 +418,7 @@ def handle_behavior(state: AgentState, *, client: Any = None) -> None:
     )
     if state.retry_count < state.max_execute_retries:
         state.retry_count += 1
-        for step in state.plan:
-            if step.status != "skipped":
-                step.status = "pending"
+        _queue_repair_step(state, touched, "behavior")
         state.note(
             f"behavior failed; retry execute with fix context "
             f"({state.retry_count}/{state.max_execute_retries})"

@@ -1,4 +1,12 @@
-from agent.loop import handle_consistency, handle_summarize, handle_verify
+import pytest
+
+from agent.loop import (
+    handle_consistency,
+    handle_execute,
+    handle_summarize,
+    handle_verify,
+    run_agent,
+)
 from agent.state import AgentState, EditHunk, Phase, PlanStep
 
 
@@ -97,3 +105,95 @@ def test_verify_fail_retries_execute(tmp_path):
     assert state.retry_count == 1
     # rollback restored original
     assert f.read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_repair_round_keeps_finished_edits(tmp_path, fake_llm):
+    (tmp_path / "c").mkdir()
+    (tmp_path / "r").mkdir()
+    ctrl = tmp_path / "c" / "ctrl.js"
+    ctrl.write_text("exports.foo = 1;\n", encoding="utf-8")
+    routes = tmp_path / "r" / "routes.js"
+    routes.write_text("const notes = require('../c/ctrl.js');\nnotes.bar();\n", encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="add bar", max_execute_retries=3)
+    state.phase = Phase.CONSISTENCY
+    state.plan = [PlanStep(id="1", description="call bar", files=["r/routes.js"], status="done")]
+    state.applied_edits = [
+        EditHunk(path="r/routes.js", start_line=2, end_line=1, new_text="notes.bar();\n")
+    ]
+    state.backups = {"r/routes.js": "const notes = require('../c/ctrl.js');\n"}
+    state.graph = {"r/routes.js": ["c/ctrl.js"], "c/ctrl.js": []}
+    handle_consistency(state, client=None)
+
+    def reply(prompt):
+        if "call bar" in prompt:
+            return {"edits": []}  # finished step: nothing left to change
+        return {"edits": [{"path": "c/ctrl.js", "start_line": 2, "end_line": 1,
+                           "new_text": "exports.bar = () => {};\n"}]}
+
+    handle_execute(state, client=fake_llm(reply))
+    assert state.phase == Phase.VERIFY
+    assert state.plan[0].status == "done"
+    assert routes.read_text(encoding="utf-8").endswith("notes.bar();\n")
+    assert "exports.bar" in ctrl.read_text(encoding="utf-8")
+
+
+def test_failed_step_retry_keeps_earlier_steps(tmp_path, fake_llm):
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("y = 1\n", encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="t")
+    state.phase = Phase.EXECUTE
+    state.plan = [
+        PlanStep(id="1", description="set x", files=["a.py"]),
+        PlanStep(id="2", description="set y", files=["b.py"]),
+    ]
+
+    def reply(prompt):
+        if "set x" in prompt:
+            return {"edits": [{"path": "a.py", "start_line": 1, "end_line": 1, "new_text": "x = 2\n"}]}
+        # out-of-range lines: step 2 fails every time
+        return {"edits": [{"path": "b.py", "start_line": 5, "end_line": 6, "new_text": "y = 2\n"}]}
+
+    handle_execute(state, client=fake_llm(reply))
+    assert a.read_text(encoding="utf-8") == "x = 2\n"
+    assert [s.status for s in state.plan] == ["done", "pending"]
+    assert state.retry_count == 1
+
+
+def test_ctrl_c_rolls_back_edits(tmp_path, monkeypatch):
+    f = tmp_path / "a.py"
+    f.write_text("x = 2\n", encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="t")
+    state.phase = Phase.VERIFY
+    state.applied_edits = [EditHunk(path="a.py", start_line=1, end_line=1, new_text="x = 2\n")]
+    state.backups = {"a.py": "x = 1\n"}
+
+    def interrupt(_state):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("agent.loop.handle_verify", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_agent(state)
+    assert f.read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_deleting_a_module_still_in_use_fails_consistency(tmp_path):
+    (tmp_path / "main.py").write_text("from helpers import run\n\nrun()\n", encoding="utf-8")
+    state = AgentState(repo_path=str(tmp_path), task="remove helpers")
+    state.phase = Phase.CONSISTENCY
+    state.plan = [PlanStep(id="1", description="delete helpers", files=["helpers.py"],
+                           action="delete", status="done")]
+    state.applied_edits = [EditHunk(path="helpers.py", start_line=1, end_line=0, new_text="")]
+    state.backups = {"helpers.py": "def run():\n    pass\n"}  # file is gone from disk
+    state.graph = {"main.py": ["helpers.py"], "helpers.py": []}
+    handle_consistency(state, client=None)
+    assert state.phase == Phase.EXECUTE
+    assert "still imports 'helpers.py'" in (state.last_error or "")
+
+
+def test_summary_says_when_deep_review_did_not_complete():
+    state = AgentState(repo_path=".", task="t")
+    state.phase = Phase.SUMMARIZE
+    state.review_errors = ["behavior: model request failed: timeout"]
+    handle_summarize(state)
+    assert "**Deep review:** did not complete (behavior: model request failed: timeout)" in state.summary

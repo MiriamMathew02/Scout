@@ -58,3 +58,66 @@ def test_route_prefix_inconsistency(tmp_path: Path):
     )
     assert not result.ok
     assert any("prefix" in m.lower() for m in result.messages)
+
+
+def _route_check(tmp_path: Path, old: str, new: str):
+    (tmp_path / "routes.js").write_text(new, encoding="utf-8")
+    return check_behavior(
+        tmp_path,
+        task="t",
+        touched=["routes.js"],
+        backups={"routes.js": old},
+        candidates=["routes.js"],
+        use_llm=False,
+    )
+
+
+def test_route_prefix_check_works_for_any_resource(tmp_path: Path):
+    old = "router.get('/tasks', tasks.list);\n"
+    result = _route_check(tmp_path, old, old + "router.get('/api/tasks/search', tasks.search);\n")
+    assert not result.ok
+    assert any("/api/tasks" in m for m in result.messages)
+
+
+def test_route_prefix_check_allows_existing_dual_prefixes(tmp_path: Path):
+    old = "app.get('/users', pages.users);\napp.get('/api/users', api.users);\n"
+    result = _route_check(tmp_path, old, old + "app.get('/users/:id', pages.user);\n")
+    assert result.ok, result.messages
+
+
+def test_route_prefix_check_allows_moving_every_route(tmp_path: Path):
+    old = "app.get('/notes', notes.list);\napp.post('/notes', notes.create);\n"
+    new = "app.get('/api/notes', notes.list);\napp.post('/api/notes', notes.create);\n"
+    result = _route_check(tmp_path, old, new)
+    assert result.ok, result.messages
+
+
+class _BrokenLLM:
+    """Client whose every request fails, like a provider outage."""
+
+    def __init__(self):
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kwargs):
+        raise ConnectionError("provider unavailable")
+
+
+def test_failed_acceptance_review_is_not_reported_as_clean(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    result = check_behavior(
+        tmp_path, task="t", touched=["a.py"], backups={"a.py": "x = 0\n"},
+        candidates=["a.py"], use_llm=True, client=_BrokenLLM(),
+    )
+    assert result.review_error and "provider unavailable" in result.review_error
+    assert not any("no gaps reported" in m for m in result.messages)
+    assert any("did not complete" in m for m in result.messages)
+
+
+def test_malformed_acceptance_reply_is_not_reported_as_clean(tmp_path: Path, fake_llm):
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    result = check_behavior(
+        tmp_path, task="t", touched=["a.py"], backups={"a.py": "x = 0\n"},
+        candidates=["a.py"], use_llm=True, client=fake_llm(lambda prompt: {}),
+    )
+    assert result.review_error == "reply had neither 'ok' nor 'gaps'"

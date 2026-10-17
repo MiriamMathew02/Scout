@@ -1,28 +1,35 @@
-"""Pre-apply guards: line bounds, duplicate JS declarations, obvious bad hunks."""
+"""Pre-apply guards: line bounds, duplicate top-level JS requires, obvious bad hunks."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-from agent.execution.atomic_edit import EditError
+from agent.discovery.scan import resolve_inside
+from agent.execution.atomic_edit import EditError, check_overlaps
 from agent.state import EditHunk
 
+# Top-level (unindented) declarations only: names inside functions may repeat freely.
+_EXPORT = r"(?:export\s+(?:default\s+)?)?"
 _DECL_RE = re.compile(
-    r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
+    rf"^{_EXPORT}(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[=:]",
     re.MULTILINE,
 )
 _REQUIRE_RE = re.compile(
-    r"""^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(""",
+    r"""^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(""",
     re.MULTILINE,
 )
 _FUNC_RE = re.compile(
-    r"^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
+    rf"^{_EXPORT}(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*[(<]",
     re.MULTILINE,
 )
-_EXPORTS_FN_RE = re.compile(
-    r"^\s*exports\.([A-Za-z_$][\w$]*)\s*=",
+_CLASS_RE = re.compile(
+    rf"^{_EXPORT}class\s+([A-Za-z_$][\w$]*)",
     re.MULTILINE,
+)
+# const / let / class may be declared only once per scope, in JS and TypeScript alike
+_LEXICAL_RE = re.compile(
+    rf"^{_EXPORT}(?:(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[=:]|class\s+([A-Za-z_$][\w$]*))"
 )
 
 
@@ -38,7 +45,9 @@ def validate_and_sanitize_hunks(
     cleaned: list[EditHunk] = []
 
     for h in hunks:
-        path = root / h.path.replace("\\", "/")
+        path = resolve_inside(root, h.path)
+        if path is None:
+            raise EditError(f"{h.path}: path is outside the repository; use a path inside it")
         if not path.exists():
             # create path — only allow create-style ranges
             if h.start_line == 1 and h.end_line == 0:
@@ -72,7 +81,7 @@ def validate_and_sanitize_hunks(
 
         new_text = h.new_text
         if path.suffix.lower() in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}:
-            new_text = _strip_duplicate_js_decls(text, lines, start, end, new_text)
+            new_text = _strip_duplicate_js_decls(h.path, text, lines, start, end, new_text)
 
         cleaned.append(
             EditHunk(
@@ -95,10 +104,12 @@ def validate_and_sanitize_hunks(
             # empty insert — drop
             continue
         result.append(h)
+    check_overlaps(result)  # raised here, the step re-prompts with the conflict
     return result
 
 
 def _strip_duplicate_js_decls(
+    path: str,
     full_text: str,
     lines: list[str],
     start: int,
@@ -106,8 +117,11 @@ def _strip_duplicate_js_decls(
     new_text: str,
 ) -> str:
     """
-    Remove lines from new_text that redeclare identifiers already present
-    outside the replaced region (prevents 'Identifier X has already been declared').
+    Handle new top-level declarations of names already declared at top level
+    outside the replaced region ('Identifier X has already been declared'):
+    re-added require lines are dropped, and a second const / let / class raises
+    EditError so the model edits the existing one. TypeScript gets no syntax check
+    later, so this has to catch it here. Indented (local) names are left alone.
     """
     if end < start:
         kept_outside = lines[: start - 1] + lines[start - 1 :]
@@ -126,6 +140,12 @@ def _strip_duplicate_js_decls(
         if names and any(n in existing for n in names):
             # skip re-declaration
             continue
+        clash = _lexical_name(bare)
+        if clash and clash in existing:
+            raise EditError(
+                f"{path}: new code declares top-level '{clash}' a second time. "
+                "Change the existing declaration instead of adding another."
+            )
         out_lines.append(line if line.endswith("\n") else line + "\n")
 
     # If we stripped everything but original had content, keep original new_text
@@ -139,16 +159,18 @@ def _strip_duplicate_js_decls(
 
 def _declared_names(text: str) -> set[str]:
     names: set[str] = set()
-    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE, _EXPORTS_FN_RE):
+    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE, _CLASS_RE):
         for m in rx.finditer(text):
             names.add(m.group(1))
     return names
 
 
 def _names_declared_on_line(line: str) -> set[str]:
-    names: set[str] = set()
-    for rx in (_DECL_RE, _REQUIRE_RE, _FUNC_RE):
-        m = rx.match(line)
-        if m:
-            names.add(m.group(1))
-    return names
+    # Only re-added requires are stripped; see _lexical_name for other duplicates.
+    m = _REQUIRE_RE.match(line)
+    return {m.group(1)} if m else set()
+
+
+def _lexical_name(line: str) -> str | None:
+    m = _LEXICAL_RE.match(line)
+    return (m.group(1) or m.group(2)) if m else None

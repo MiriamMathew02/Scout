@@ -5,31 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from agent.discovery.snippets import excerpt_for_prompt, read_line_numbered
-from agent.execution.atomic_edit import EditError, apply_edits, rollback_edits
+from agent.discovery.heuristics import _task_tokens
+from agent.discovery.scan import clean_rel_path, resolve_inside
+from agent.discovery.snippets import read_line_numbered
+from agent.execution.atomic_edit import EditError, apply_edits, read_exact, rollback_edits
 from agent.execution.sanitize import validate_and_sanitize_hunks
 from agent.llm import chat_json
+from agent.planning.plan import is_ops_step
 from agent.prompts import EXECUTE_SYSTEM, execute_user_prompt
 from agent.state import AgentState, EditHunk, PlanStep
 from agent.verification.verify import verify_changes
 
 MAX_HUNK_FRACTION = 0.70
-_SKIP_STEP_RE = (
-    "restart",
-    "reboot",
-    "install package",
-    "npm install",
-    "yarn install",
-    "pip install",
-    "docker",
-    "deploy",
-    "manual",
-)
-
-
-def _is_noop_ops_step(step: PlanStep) -> bool:
-    text = f"{step.description} {' '.join(step.files)}".lower()
-    return any(k in text for k in _SKIP_STEP_RE)
+_WINDOW = 90  # lines shown on each side of a focus line in long files
 
 
 def _parse_hunks(
@@ -42,7 +30,7 @@ def _parse_hunks(
     for item in raw_edits:
         if not isinstance(item, dict):
             continue
-        path = str(item.get("path", "")).replace("\\", "/").lstrip("./")
+        path = clean_rel_path(str(item.get("path", "")))
         if not path:
             continue
         try:
@@ -55,11 +43,11 @@ def _parse_hunks(
             new_text = ""
         if not isinstance(new_text, str):
             new_text = str(new_text)
-        if new_text.strip() and not _looks_like_code(new_text) and len(new_text) < 40:
-            continue
         rationale = str(item.get("rationale", "") or "")
 
-        full = root / path
+        full = resolve_inside(root, path)
+        if full is None:
+            raise EditError(f"{path}: path is outside the repository; use a path inside it")
         if full.is_file() and step.action == "modify":
             n = len(full.read_text(encoding="utf-8", errors="replace").splitlines())
             if end >= start and n > 0:
@@ -82,42 +70,73 @@ def _parse_hunks(
     return hunks
 
 
-def _looks_like_code(text: str) -> bool:
-    code_signals = (
-        "{",
-        "}",
-        ";",
-        "=",
-        "function",
-        "const ",
-        "let ",
-        "var ",
-        "def ",
-        "class ",
-        "import ",
-        "require(",
-        "module.exports",
-        "exports.",
-        "return ",
-        "=>",
-        "/*",
-        "//",
-    )
-    return any(s in text for s in code_signals)
+def _guess_focus_line(lines: list[str], hints: str) -> int | None:
+    """1-based line mentioning the most words from the step/task, if any line does."""
+    tokens = set(_task_tokens(hints))
+    best, best_score = None, 0
+    for i, line in enumerate(lines, start=1):
+        low = line.lower()
+        score = sum(1 for t in tokens if t in low)
+        if score > best_score:
+            best, best_score = i, score
+    return best
 
 
-def _load_file_for_prompt(root: Path, rel: str) -> tuple[str, int]:
-    full = root / rel
+def _merge_ranges(ranges: list[tuple[int, int]], n: int) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for a, b in sorted((max(1, a), min(n, b)) for a, b in ranges):
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _load_file_for_prompt(
+    root: Path,
+    rel: str,
+    *,
+    hints: str = "",
+    ranges: list[tuple[int, int]] | None = None,
+) -> tuple[str, int, list[tuple[int, int]] | None]:
+    """Return (prompt text, line count, shown line ranges or None if the whole file is shown)."""
+    full = resolve_inside(root, rel)
+    if full is None:
+        return "(outside the repository; not shown)", 0, None
     if not full.is_file():
-        return "(file does not exist yet)", 0
+        return "(file does not exist yet)", 0, None
     try:
         raw = full.read_text(encoding="utf-8", errors="replace")
-        size_lines = len(raw.splitlines())
-        if size_lines > 250:
-            return excerpt_for_prompt(full, max_lines=180), size_lines
-        return read_line_numbered(full), size_lines
     except OSError as exc:
-        return f"(unreadable: {exc})", 0
+        return f"(unreadable: {exc})", 0, None
+    lines = raw.splitlines()
+    n = len(lines)
+    if n <= 250:
+        return read_line_numbered(full), n, None
+    if not ranges:
+        focus = _guess_focus_line(lines, hints)
+        ranges = [(1, 180)] if focus is None else [(focus - _WINDOW, focus + _WINDOW)]
+    shown = _merge_ranges(ranges, n)
+    parts: list[str] = []
+    prev = 0
+    for a, b in shown:
+        if a > prev + 1:
+            parts.append(f"... (lines {prev + 1}-{a - 1} omitted)")
+        parts.append("\n".join(f"{i}|{lines[i - 1]}" for i in range(a, b + 1)))
+        prev = b
+    if prev < n:
+        parts.append(f"... (lines {prev + 1}-{n} omitted)")
+    return "\n".join(parts), n, shown
+
+
+def _within(hunk: EditHunk, shown: list[tuple[int, int]]) -> bool:
+    for first, last in shown:
+        if hunk.end_line < hunk.start_line:  # insert before start_line
+            if first <= hunk.start_line <= last + 1:
+                return True
+        elif first <= hunk.start_line and hunk.end_line <= last:
+            return True
+    return False
 
 
 def _related_files_for_step(state: AgentState, step: PlanStep, *, limit: int = 4) -> list[str]:
@@ -167,21 +186,30 @@ def propose_edits(
     client: Any = None,
     force: bool = False,
     bound_error: str | None = None,
+    ranges: dict[str, list[tuple[int, int]]] | None = None,
 ) -> list[EditHunk]:
     """Ask the LLM for EditHunks for one plan step. Retries once if empty/invalid."""
     root = Path(state.repo_path)
     files_content: dict[str, str] = {}
     line_counts: dict[str, int] = {}
+    partial: dict[str, list[tuple[int, int]]] = {}
 
     primary = list(step.files)
     related = _related_files_for_step(state, step)
     for rel in primary + related:
         if rel in files_content:
             continue
-        content, n = _load_file_for_prompt(root, rel)
+        content, n, shown = _load_file_for_prompt(
+            root,
+            rel,
+            hints=f"{step.description} {state.task}",
+            ranges=(ranges or {}).get(rel),
+        )
         files_content[rel] = content
         if n:
             line_counts[rel] = n
+        if shown:
+            partial[rel] = shown
 
     counts_note = ", ".join(f"{p}={n} lines" for p, n in line_counts.items())
     extra_parts: list[str] = []
@@ -189,6 +217,13 @@ def propose_edits(
         extra_parts.append(
             f"Line counts for current files: {counts_note}. "
             "Never use start_line/end_line beyond these counts."
+        )
+    if partial:
+        shown_note = "; ".join(
+            f"{p} lines " + ", ".join(f"{a}-{b}" for a, b in rs) for p, rs in partial.items()
+        )
+        extra_parts.append(
+            f"Only part of some files is shown: {shown_note}. Edit only lines that are shown."
         )
     if state.last_error:
         extra_parts.append(state.last_error)
@@ -234,6 +269,25 @@ def propose_edits(
 
     hunks = _parse_hunks(raw_edits, root=root, step=step)
 
+    unseen = [h for h in hunks if h.path in partial and not _within(h, partial[h.path])]
+    if unseen:
+        where = ", ".join(f"{h.path} lines {h.start_line}-{h.end_line}" for h in unseen)
+        msg = f"Some edits target lines you were not shown ({where})."
+        if ranges is None:
+            # Keep what was shown, add every region the model asked about, and ask once more
+            wider = {p: list(rs) for p, rs in partial.items()}
+            for h in unseen:
+                wider[h.path].append((h.start_line - _WINDOW, max(h.start_line, h.end_line) + _WINDOW))
+            return propose_edits(
+                state,
+                step,
+                client=client,
+                force=True,
+                bound_error=msg + " Those parts are shown now; base the edits on them.",
+                ranges=wider,
+            )
+        raise EditError(msg)
+
     if not hunks and not force:
         return propose_edits(state, step, client=client, force=True)
 
@@ -249,19 +303,21 @@ def run_plan_step(
     """Propose edits for a step, sanitize, apply, then syntax-check."""
     root = Path(state.repo_path)
 
-    if _is_noop_ops_step(step):
+    if is_ops_step(step.description):
         step.status = "skipped"
         return [f"step {step.id}: skipped non-code/ops step"]
 
     if step.action == "delete":
         summaries: list[str] = []
         for rel in step.files:
-            path = root / rel
+            path = resolve_inside(root, rel)
+            if path is None or not rel or (root / rel).is_symlink():
+                raise EditError(f"{rel}: refusing to delete a path outside the repository or a symlink")
             if not path.exists():
                 summaries.append(f"{rel}: already absent")
                 continue
             if state.backups is not None and rel not in state.backups:
-                state.backups[rel] = path.read_text(encoding="utf-8", errors="replace")
+                state.backups[rel] = read_exact(path)
             if not state.dry_run:
                 path.unlink()
             summaries.append(f"{rel}: deleted")
@@ -293,20 +349,22 @@ def run_plan_step(
 
     touched = list(dict.fromkeys(h.path for h in hunks))
     # Snapshot pre-step content so a bad step does not wipe earlier good steps
-    pre_step: dict[str, str] = {}
+    pre_step: dict[str, str | None] = {}
     for rel in touched:
         path = root / rel
-        if path.is_file():
-            pre_step[rel] = path.read_text(encoding="utf-8", errors="replace")
-        else:
-            pre_step[rel] = ""
+        pre_step[rel] = read_exact(path) if path.is_file() else None
 
-    summaries = apply_edits(
-        root,
-        hunks,
-        dry_run=state.dry_run,
-        backups=state.backups,
-    )
+    try:
+        summaries = apply_edits(
+            root,
+            hunks,
+            dry_run=state.dry_run,
+            backups=state.backups,
+        )
+    except EditError:
+        if not state.dry_run:
+            rollback_edits(root, pre_step)  # leave no half-applied step behind
+        raise
     state.applied_edits.extend(hunks)
 
     if not state.dry_run:

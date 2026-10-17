@@ -7,6 +7,7 @@ Tier 2: optional project tests (when enabled).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from agent.verification.verify import verify_changes
 class BehaviorResult:
     ok: bool
     messages: list[str] = field(default_factory=list)
+    review_error: str | None = None  # set when the LLM review was asked for but did not complete
 
     def as_text(self) -> str:
         status = "PASS" if self.ok else "FAIL"
@@ -51,7 +53,7 @@ def check_behavior(
     *,
     task: str,
     touched: list[str],
-    backups: dict[str, str],
+    backups: dict[str, str | None],
     candidates: list[str],
     stack_hints: Any = None,
     run_tests: bool = False,
@@ -79,21 +81,24 @@ def check_behavior(
     else:
         messages.append("No new schema fields detected in diff (static).")
 
-    # Route prefix consistency: if most routes use /notes and one uses /api/notes
-    route_issue = _check_route_prefix_consistency(root, touched)
+    # Route prefix consistency: new routes on /x when existing ones use /api/x (or reverse)
+    route_issue = _check_route_prefix_consistency(root, touched, backups, candidates)
     if route_issue:
         messages.append(route_issue)
         hard_fail = True
 
+    review_error = None
     if use_llm and not hard_fail:
-        gaps = _llm_behavior_gaps(
+        gaps, review_error = _llm_behavior_gaps(
             root,
             task=task,
             touched=touched,
             model=model,
             client=client,
         )
-        if gaps:
+        if review_error:
+            messages.append(f"LLM acceptance review did not complete: {review_error}")
+        elif gaps:
             hard_fail = True
             messages.append("LLM acceptance review found gaps:")
             messages.extend(f"- {g}" for g in gaps)
@@ -110,60 +115,65 @@ def check_behavior(
         else:
             messages.append("Project tests: OK (or skipped if unavailable).")
 
-    return BehaviorResult(ok=not hard_fail, messages=messages)
+    return BehaviorResult(ok=not hard_fail, messages=messages, review_error=review_error)
 
 
-def _check_route_prefix_consistency(root: Path, touched: list[str]) -> str | None:
-    import re
+_ROUTE_DEF_RE = re.compile(
+    r"""\b(?:app|router)\.(?:get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]""",
+    re.I,
+)
 
-    route_re = re.compile(
-        r"""app\.(get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]""",
-        re.I,
-    )
-    paths: list[str] = []
-    # Scan all route-like files under app/routes and touched
-    scan = list(touched)
-    routes_dir = root / "app" / "routes"
-    if routes_dir.is_dir():
-        for p in routes_dir.rglob("*.js"):
-            rel = p.relative_to(root).as_posix()
-            if rel not in scan:
-                scan.append(rel)
+
+def _route_paths(text: str) -> list[str]:
+    return [m.group(1) for m in _ROUTE_DEF_RE.finditer(text)]
+
+
+def _prefix_bucket(p: str) -> str:
+    parts = [x for x in p.split("/") if x]
+    if not parts:
+        return "/"
+    if parts[0] == "api" and len(parts) > 1:
+        return "/api/" + parts[1]
+    return "/" + parts[0]
+
+
+def _check_route_prefix_consistency(
+    root: Path,
+    touched: list[str],
+    backups: dict[str, str | None],
+    candidates: list[str],
+) -> str | None:
+    """Flag routes added in this run on '/x' when other routes use '/api/x', or the reverse.
+
+    Only new routes are judged, so an app that already serves both prefixes on purpose
+    (pages on /users, JSON on /api/users) is left alone. The conflict must still exist
+    in the current files: moving every /notes route to /api/notes is not a conflict.
+    """
+    old_buckets: set[str] = set()
+    current_buckets: set[str] = set()
+    new_paths: list[str] = []
+    scan = list(dict.fromkeys(touched + [c for c in candidates if "route" in c.lower()]))
     for rel in scan:
         path = root / rel
         if not path.is_file() or path.suffix not in {".js", ".ts", ".mjs", ".cjs"}:
             continue
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            current = _route_paths(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        for m in route_re.finditer(text):
-            paths.append(m.group(2))
+        before = _route_paths(backups.get(rel) or "") if rel in touched else current
+        old_buckets |= {_prefix_bucket(p) for p in before}
+        current_buckets |= {_prefix_bucket(p) for p in current}
+        new_paths += [p for p in current if p not in before]
 
-    if len(paths) < 2:
-        return None
-
-    def prefix_bucket(p: str) -> str:
-        parts = [x for x in p.split("/") if x]
-        if not parts:
-            return "/"
-        if parts[0] == "api" and len(parts) > 1:
-            return "/api/" + parts[1]
-        return "/" + parts[0]
-
-    buckets: dict[str, int] = {}
-    for p in paths:
-        b = prefix_bucket(p)
-        buckets[b] = buckets.get(b, 0) + 1
-
-    # If both /notes and /api/notes exist, flag
-    if any(b.startswith("/notes") for b in buckets) and any(
-        b.startswith("/api/notes") or b == "/api/notes" for b in buckets
-    ):
-        return (
-            "Route prefix inconsistency: some endpoints use '/notes' and others "
-            "'/api/notes...'. Prefer one API prefix matching existing routes."
-        )
+    for p in new_paths:
+        bucket = _prefix_bucket(p)
+        twin = bucket[len("/api"):] if bucket.startswith("/api/") else "/api" + bucket
+        if twin in current_buckets and bucket not in old_buckets:
+            return (
+                f"Route prefix inconsistency: new route '{p}' uses '{bucket}', but other "
+                f"routes use '{twin}'. Prefer one API prefix matching existing routes."
+            )
     return None
 
 
@@ -174,7 +184,8 @@ def _llm_behavior_gaps(
     touched: list[str],
     model: str | None,
     client: Any,
-) -> list[str]:
+) -> tuple[list[str], str | None]:
+    """Return (gaps, error); error says why the review did not complete."""
     from agent.discovery.snippets import read_line_numbered
     from agent.llm import DEFAULT_MODEL
 
@@ -192,7 +203,7 @@ def _llm_behavior_gaps(
             body = "\n".join(lines[:180]) + "\n..."
         parts.append(f"===== {rel} =====\n{body}")
     if not parts:
-        return []
+        return [], None
 
     user = f"Task:\n{task}\n\nChanged files:\n" + "\n\n".join(parts)
     try:
@@ -203,12 +214,15 @@ def _llm_behavior_gaps(
             client=client,
             max_tokens=1500,
         )
-    except Exception:  # noqa: BLE001
-        return []
+    except Exception as exc:  # noqa: BLE001
+        return [], f"model request failed: {exc}"
 
-    if data.get("ok") is True and not data.get("gaps"):
-        return []
+    if "ok" not in data and "gaps" not in data:
+        return [], "reply had neither 'ok' nor 'gaps'"
     gaps = data.get("gaps") or []
     if not isinstance(gaps, list):
-        return []
-    return [str(g) for g in gaps if str(g).strip()]
+        return [], "reply had no 'gaps' list"
+    gaps = [str(g) for g in gaps if str(g).strip()]
+    if data.get("ok") is False and not gaps:
+        return [], "reply said the task is not met but listed no gaps"
+    return gaps, None
