@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.discovery.graph import topological_edit_order
-from agent.discovery.scan import clean_rel_path
+from agent.discovery.scan import clean_rel_path, resolve_inside
 from agent.llm import chat_json
 from agent.prompts import PLAN_SYSTEM, plan_user_prompt
 from agent.state import AgentState, PlanStep
@@ -121,6 +121,7 @@ def validate_plan(state: AgentState, steps: list[PlanStep]) -> list[PlanStep]:
             continue
         if is_ops_step(step.description):
             continue
+        step.files = [f for f in step.files if resolve_inside(root, f) is not None]
         if not step.files and step.action != "create":
             continue
         if step.action == "modify":

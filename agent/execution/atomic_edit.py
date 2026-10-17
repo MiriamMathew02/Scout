@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent.discovery.scan import resolve_inside
 from agent.state import EditHunk
 
 
@@ -153,14 +154,9 @@ def read_exact(path: Path) -> str:
 
 
 def _safe_path(root: Path, rel: str) -> Path:
-    rel_norm = rel.replace("\\", "/").lstrip("/")
-    if rel_norm.startswith("..") or "/../" in f"/{rel_norm}/":
+    full = resolve_inside(root, rel.replace("\\", "/").lstrip("/"))
+    if full is None:
         raise EditError(f"Path escapes repository: {rel}")
-    full = (root / rel_norm).resolve()
-    try:
-        full.relative_to(root)
-    except ValueError as exc:
-        raise EditError(f"Path escapes repository: {rel}") from exc
     return full
 
 

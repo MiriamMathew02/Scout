@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.discovery.heuristics import _task_tokens
-from agent.discovery.scan import clean_rel_path
+from agent.discovery.scan import clean_rel_path, resolve_inside
 from agent.discovery.snippets import excerpt_for_prompt, read_line_numbered
 from agent.execution.atomic_edit import EditError, apply_edits, read_exact, rollback_edits
 from agent.execution.sanitize import validate_and_sanitize_hunks
@@ -44,7 +44,9 @@ def _parse_hunks(
             new_text = str(new_text)
         rationale = str(item.get("rationale", "") or "")
 
-        full = root / path
+        full = resolve_inside(root, path)
+        if full is None:
+            raise EditError(f"{path}: path is outside the repository; use a path inside it")
         if full.is_file() and step.action == "modify":
             n = len(full.read_text(encoding="utf-8", errors="replace").splitlines())
             if end >= start and n > 0:
@@ -87,7 +89,9 @@ def _load_file_for_prompt(
     focus_line: int | None = None,
 ) -> tuple[str, int, tuple[int, int] | None]:
     """Return (prompt text, line count, shown line range or None if the whole file is shown)."""
-    full = root / rel
+    full = resolve_inside(root, rel)
+    if full is None:
+        return "(outside the repository; not shown)", 0, None
     if not full.is_file():
         return "(file does not exist yet)", 0, None
     try:
@@ -285,7 +289,9 @@ def run_plan_step(
     if step.action == "delete":
         summaries: list[str] = []
         for rel in step.files:
-            path = root / rel
+            path = resolve_inside(root, rel)
+            if path is None or not rel or (root / rel).is_symlink():
+                raise EditError(f"{rel}: refusing to delete a path outside the repository or a symlink")
             if not path.exists():
                 summaries.append(f"{rel}: already absent")
                 continue

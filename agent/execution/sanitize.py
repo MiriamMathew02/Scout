@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from agent.discovery.scan import resolve_inside
 from agent.execution.atomic_edit import EditError
 from agent.state import EditHunk
 
@@ -35,7 +36,9 @@ def validate_and_sanitize_hunks(
     cleaned: list[EditHunk] = []
 
     for h in hunks:
-        path = root / h.path.replace("\\", "/")
+        path = resolve_inside(root, h.path)
+        if path is None:
+            raise EditError(f"{h.path}: path is outside the repository; use a path inside it")
         if not path.exists():
             # create path — only allow create-style ranges
             if h.start_line == 1 and h.end_line == 0:

@@ -77,14 +77,33 @@ def scan_file_tree(
 
 
 def clean_rel_path(path: str) -> str:
-    """Normalize a model-supplied path: forward slashes, no leading '/', './' or '../'.
+    """Normalize a model-supplied path: forward slashes, no leading '/' or './'.
 
     Unlike lstrip("./"), this keeps the dot in names like .github/ or .eslintrc.js.
+    '..' segments are kept, so resolve_inside() rejects the path instead of it
+    quietly pointing somewhere else.
     """
     parts = path.replace("\\", "/").split("/")
-    while parts and parts[0] in ("", ".", ".."):
+    while parts and parts[0] in ("", "."):
         parts.pop(0)
     return "/".join(parts)
+
+
+def resolve_inside(repo_root: Path | str, rel: str) -> Path | None:
+    """Absolute path for rel, or None if it could reach outside repo_root.
+
+    The one containment check for model-supplied paths: rejects any '..' segment,
+    absolute paths, and anything that resolves (through symlinks) outside the repo.
+    """
+    if ".." in rel.replace("\\", "/").split("/"):
+        return None
+    root = Path(repo_root).resolve()
+    full = (root / rel).resolve()
+    try:
+        full.relative_to(root)
+    except ValueError:
+        return None
+    return full
 
 
 def _format_tree(paths: list[str], *, max_entries: int) -> str:

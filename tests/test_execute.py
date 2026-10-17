@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from agent.execution.execute import _load_file_for_prompt, _parse_hunks, propose_edits
+import pytest
+
+from agent.execution.atomic_edit import EditError
+from agent.execution.execute import _load_file_for_prompt, _parse_hunks, propose_edits, run_plan_step
 from agent.state import AgentState, PlanStep
 
 
@@ -50,3 +53,34 @@ def test_short_python_edit_is_kept(tmp_path: Path):
         step=step,
     )
     assert [h.new_text for h in hunks] == ["    print('hi')\n"]
+
+
+def _repo_with_outside_file(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    (repo / "sub").mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("dummy\n", encoding="utf-8")
+    return repo, outside
+
+
+def test_delete_step_cannot_reach_outside_the_repo(tmp_path: Path):
+    repo, outside = _repo_with_outside_file(tmp_path)
+    state = AgentState(repo_path=str(repo), task="t")
+    step = PlanStep(id="1", description="remove old file", files=["sub/../../outside.txt"], action="delete")
+    with pytest.raises(EditError, match="outside the repository"):
+        run_plan_step(state, step)
+    assert outside.exists()
+    assert state.backups == {}
+
+
+def test_files_outside_the_repo_are_not_shown_or_edited(tmp_path: Path):
+    repo, _ = _repo_with_outside_file(tmp_path)
+    text, n, _shown = _load_file_for_prompt(repo, "sub/../../outside.txt")
+    assert "dummy" not in text and n == 0
+    step = PlanStep(id="1", description="d", files=["a.py"])
+    with pytest.raises(EditError, match="outside the repository"):
+        _parse_hunks(
+            [{"path": "sub/../../outside.txt", "start_line": 1, "end_line": 1, "new_text": "x\n"}],
+            root=repo,
+            step=step,
+        )
